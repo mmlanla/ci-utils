@@ -2,6 +2,10 @@ name: c211-i82090-cloudrun-cells
 on:
   workflow_dispatch:
     inputs:
+      cells:
+        description: 'comma-separated cell tags to run (empty = all six; used for bounded retries/cleanup)'
+        required: false
+        default: ''
       provider:
         description: 'wif provider'
         required: false
@@ -28,6 +32,7 @@ jobs:
     steps:
       - name: cloudrun-gpu-six-cells-device-proof
         env:
+          CELLS: ${{ github.event.inputs.cells }}
           PROVIDER: ${{ github.event.inputs.provider }}
           PROJECT: ${{ github.event.inputs.project }}
           PNAME: ${{ github.event.inputs.pname }}
@@ -67,6 +72,9 @@ jobs:
           ]
           SWEEP_REGIONS = ['asia-south1', 'asia-south2', 'asia-southeast1', 'europe-west1',
                            'europe-west4', 'us-central1', 'us-east4']
+          CELLS_FILTER = [x.strip() for x in (os.environ.get('CELLS', '') or '').split(',') if x.strip()]
+          if CELLS_FILTER:
+              CELLS = [c for c in CELLS if c['tag'] in CELLS_FILTER]
 
 
           def log(*a):
@@ -428,6 +436,17 @@ jobs:
                   rec['create_op_done'] = bool(opj.get('done'))
                   rec['create_op_error'] = short(json.dumps(opj.get('error') or {}), 500)
                   if opj.get('error'):
+                      # never leave a failed-create job behind: delete it and read back
+                      std, rbd = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s'
+                                     % (PROJECT, region, job), token=satok, method=M_DEL)
+                      rec['cleanup_on_create_failure'] = [std, short(rbd, 200)]
+                      jd = jl(rbd)
+                      if jd.get('name'):
+                          poll_operation(jd['name'], satok, 120)
+                      time.sleep(3)
+                      strb, rbrb = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s'
+                                       % (PROJECT, region, job), token=satok)
+                      rec['readback_after_create_failure'] = [strb, short(rbrb, 200)]
                       rec['verdict'] = 'CREATE_OP_FAILED'
                       return rec
               st, rb = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s:run'
@@ -600,6 +619,7 @@ jobs:
                   time.sleep(5)
 
               out['cells'] = results
+              out['cells_filter'] = CELLS_FILTER
               # ---------------- multi-region leftover sweep ----------------
               left = {}
               for reg in SWEEP_REGIONS:
