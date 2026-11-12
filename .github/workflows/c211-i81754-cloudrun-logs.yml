@@ -1,0 +1,173 @@
+name: c211-i81754-cloudrun-logs
+on:
+  workflow_dispatch:
+    inputs:
+      targets:
+        description: 'json list of {region,job}'
+        required: true
+        default: '[]'
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  logs:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: cloudrun-logs
+        env:
+          TARGETS: ${{ github.event.inputs.targets }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PYSCRIPT'
+          import os, json, time, subprocess, urllib.request, urllib.error, urllib.parse, base64, re
+
+          # intent 81754: read-only Cloud Logging verification of the Cloud Run GPU task stdout
+          PROVIDER = os.environ.get('PROVIDER', 'projects/409106094209/locations/global/workloadIdentityPools/github-pool/providers/github-provider')
+          PROJECT = os.environ.get('PROJECT', '409106094209')
+          PNAME = os.environ.get('PNAME', 'dkeramik-fullstack')
+          SA = os.environ.get('SA', 'github-actions-sa@dkeramik-fullstack.iam.gserviceaccount.com')
+          TARGETS = json.loads(os.environ.get('TARGETS', '[]'))
+          T0 = time.time()
+
+
+          def log(*a):
+              print('[%6.0fs]' % (time.time() - T0), *a, flush=True)
+
+
+          def emit(o):
+              b = base64.b64encode(json.dumps(o, sort_keys=True).encode()).decode()
+              print('RESULT_LEN %d' % len(b), flush=True)
+              n = (len(b) + 2999) // 3000
+              for i in range(n):
+                  print('RESULT_B64 %d %d %s' % (i + 1, n, b[i * 3000:(i + 1) * 3000]), flush=True)
+
+
+          def mint(aud):
+              base = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL', '')
+              if not base:
+                  return ''
+              u = base + '&audience=' + urllib.parse.quote(aud, safe='')
+              t = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN', '')
+              try:
+                  out = subprocess.run(['curl', '-sS', '-m', '30', '-H', 'Authorization: Bearer ' + t, u],
+                                       capture_output=True, text=True).stdout
+                  return json.loads(out).get('value', '')
+              except Exception:
+                  return ''
+
+
+          def req(url, data=None, token=None, timeout=90):
+              h = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+              if token:
+                  h['Authorization'] = 'Bearer ' + token
+              r = urllib.request.Request(url, data=data, headers=h)
+              try:
+                  resp = urllib.request.urlopen(r, timeout=timeout)
+                  return resp.status, resp.read().decode('utf-8', 'replace')
+              except urllib.error.HTTPError as e:
+                  return e.code, (e.read() or b'').decode('utf-8', 'replace')
+              except Exception as e:
+                  return -1, repr(e)[:200]
+
+
+          def jl(b):
+              try:
+                  return json.loads(b)
+              except Exception:
+                  return {}
+
+
+          def short(b, n=400):
+              return (b or '').replace('\n', ' ')[:n]
+
+
+          def redact(o, secrets):
+              if isinstance(o, str):
+                  s = o
+                  for sec in secrets:
+                      if sec:
+                          s = s.replace(sec, 'REDACTED')
+                  return s
+              if isinstance(o, list):
+                  return [redact(x, secrets) for x in o]
+              if isinstance(o, dict):
+                  return {k: redact(v, secrets) for k, v in o.items()}
+              return o
+
+
+          def main():
+              out = {'intent': 81754, 'mode': 'cloud_logging_readonly', 'targets': TARGETS,
+                     't_start': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+              aud = '//iam.googleapis.com/' + PROVIDER
+              tok = mint(aud)
+              out['mint'] = 'ok' if tok else 'MINT_FAIL'
+              if not tok:
+                  emit(out); return
+              body = json.dumps({'audience': aud,
+                                 'grantType': 'urn:ietf:params:oauth:grant-type:token-exchange',
+                                 'requestedTokenType': 'urn:ietf:params:oauth:token-type:access_token',
+                                 'scope': 'https://www.googleapis.com/auth/cloud-platform',
+                                 'subjectTokenType': 'urn:ietf:params:oauth:token-type:jwt',
+                                 'subjectToken': tok}).encode()
+              st, rb = req('https://sts.googleapis.com/v1/token', data=body)
+              out['sts'] = st
+              if st != 200:
+                  out['sts_body'] = short(rb, 400); emit(out); return
+              fed = jl(rb).get('access_token')
+              st2, rb2 = req('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken'
+                             % urllib.parse.quote(SA, safe=''),
+                             data=json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
+                                              'lifetime': '1800s'}).encode(), token=fed)
+              out['gen'] = st2
+              satok = jl(rb2).get('accessToken')
+              if st2 != 200 or not satok:
+                  out['gen_body'] = short(rb2, 400); emit(out); return
+              out['token_len'] = len(satok)
+              results = {}
+              for t in TARGETS:
+                  region = t.get('region'); job = t.get('job')
+                  flt = ('resource.type="cloud_run_job" AND resource.labels.job_name="%s" AND resource.labels.location="%s"'
+                         % (job, region))
+                  q = {'resourceNames': ['projects/' + PNAME], 'filter': flt,
+                       'orderBy': 'timestamp asc', 'pageSize': 300}
+                  st3, rb3 = req('https://logging.googleapis.com/v2/entries:list', data=json.dumps(q).encode(), token=satok)
+                  rec = {'http': st3, 'filter': flt}
+                  if st3 != 200:
+                      rec['body'] = short(rb3, 500)
+                  else:
+                      jj = jl(rb3)
+                      ents = jj.get('entries') or []
+                      texts = []
+                      for e in ents:
+                          tp = e.get('textPayload')
+                          if tp is None and isinstance(e.get('jsonPayload'), dict):
+                              tp = e['jsonPayload'].get('message') or json.dumps(e['jsonPayload'])[:400]
+                          if tp:
+                              texts.append(tp)
+                      rec['n_entries'] = len(ents)
+                      rec['texts'] = texts[:200]
+                      rec['gpu_lines'] = [x for x in texts if ('GPU-' in x or 'C211_I81754' in x or 'nvidia-smi' in x or 'NVIDIA' in x)]
+                  results['%s/%s' % (region, job)] = rec
+                  time.sleep(0.5)
+              out['results'] = results
+              out['t_end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              out = redact(out, [satok, tok])
+              emit(out)
+              print('DONE', flush=True)
+
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as ex:
+                  import traceback
+                  print('FATAL ' + repr(ex), flush=True)
+                  traceback.print_exc()
+                  try:
+                      emit({'fatal': repr(ex)[:400]})
+                  except Exception:
+                      pass
+          PYSCRIPT
