@@ -1,0 +1,205 @@
+name: c211-i82091-gke
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'wif provider'
+        required: false
+        default: 'projects/409106094209/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+      project:
+        description: 'project number'
+        required: false
+        default: '409106094209'
+      pname:
+        description: 'project id'
+        required: false
+        default: 'dkeramik-fullstack'
+      sa:
+        description: 'service account'
+        required: false
+        default: 'github-actions-sa@dkeramik-fullstack.iam.gserviceaccount.com'
+permissions:
+  id-token: write
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: gke-and-service-state
+        env:
+          PROVIDER: ${{ github.event.inputs.provider }}
+          PROJECT: ${{ github.event.inputs.project }}
+          PNAME: ${{ github.event.inputs.pname }}
+          SA: ${{ github.event.inputs.sa }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PYSCRIPT'
+          import os, json, time, subprocess, urllib.request, urllib.error, urllib.parse, base64
+
+          # intent 82091 follow-up: corrected container.googleapis.com probe + authoritative
+          # serviceusage.services.get state for the GPU-capable APIs (read-only).
+          PROVIDER = os.environ.get('PROVIDER', 'projects/409106094209/locations/global/workloadIdentityPools/github-pool/providers/github-provider')
+          PROJECT = os.environ.get('PROJECT', '409106094209')
+          PNAME = os.environ.get('PNAME', 'dkeramik-fullstack')
+          SA = os.environ.get('SA', 'github-actions-sa@dkeramik-fullstack.iam.gserviceaccount.com')
+          GH_REPO = os.environ.get('GH_REPO', '')
+          GH_RUN_ID = os.environ.get('GH_RUN_ID', '0')
+          T0 = time.time()
+
+
+          def log(*a):
+              print('[%6.0fs]' % (time.time() - T0), *a, flush=True)
+
+
+          def emit(o):
+              b = base64.b64encode(json.dumps(o, sort_keys=True).encode()).decode()
+              print('RESULT_LEN %d' % len(b), flush=True)
+              n = (len(b) + 2999) // 3000
+              for i in range(n):
+                  print('RESULT_B64 %d %d %s' % (i + 1, n, b[i * 3000:(i + 1) * 3000]), flush=True)
+
+
+          def mint(aud):
+              base = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL', '')
+              if not base:
+                  return ''
+              u = base + '&audience=' + urllib.parse.quote(aud, safe='')
+              t = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN', '')
+              try:
+                  out = subprocess.run(['curl', '-sS', '-m', '30', '-H', 'Authorization: Bearer ' + t, u],
+                                       capture_output=True, text=True).stdout
+                  return json.loads(out).get('value', '')
+              except Exception:
+                  return ''
+
+
+          def req(url, data=None, token=None, method=None, timeout=90, tries=2):
+              h = {'Accept': 'application/json'}
+              if data is not None:
+                  h['Content-Type'] = 'application/json'
+              if token:
+                  h['Authorization'] = 'Bearer ' + token
+              last = (-1, '')
+              for a in range(tries):
+                  r = urllib.request.Request(url, data=data, headers=h, method=method)
+                  try:
+                      resp = urllib.request.urlopen(r, timeout=timeout)
+                      return resp.status, resp.read().decode('utf-8', 'replace')
+                  except urllib.error.HTTPError as e:
+                      body = (e.read() or b'').decode('utf-8', 'replace')
+                      if e.code in (429, 500, 502, 503) and a + 1 < tries:
+                          time.sleep(2 + 2 * a); last = (e.code, body); continue
+                      return e.code, body
+                  except Exception as e:
+                      last = (-1, repr(e)[:200]); time.sleep(1)
+              return last
+
+
+          def jl(b):
+              try:
+                  return json.loads(b)
+              except Exception:
+                  return {}
+
+
+          def short(b, n=500):
+              return (b or '').replace('\n', ' ').replace('\r', ' ')[:n]
+
+
+          def main():
+              out = {'intent': '82091-followup', 'project': PROJECT, 'pname': PNAME,
+                     'runner_repo': GH_REPO, 'runner_run_id': GH_RUN_ID,
+                     't_start': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
+              aud = '//iam.googleapis.com/' + PROVIDER
+              tok = mint(aud)
+              out['mint'] = 'ok' if tok else 'MINT_FAIL'
+              if not tok:
+                  out['verdict'] = 'CHAIN_DEAD_GITHUB_OIDC_MINT_FAIL'; emit(out); return
+              body = json.dumps({'audience': aud,
+                                 'grantType': 'urn:ietf:params:oauth:grant-type:token-exchange',
+                                 'requestedTokenType': 'urn:ietf:params:oauth:token-type:access_token',
+                                 'scope': 'https://www.googleapis.com/auth/cloud-platform',
+                                 'subjectTokenType': 'urn:ietf:params:oauth:token-type:jwt',
+                                 'subjectToken': tok}).encode()
+              st, rb = req('https://sts.googleapis.com/v1/token', data=body)
+              out['sts'] = st
+              if st != 200:
+                  out['verdict'] = 'CHAIN_DEAD_STS_REJECT'; out['sts_body'] = short(rb, 400); emit(out); return
+              fed = jl(rb).get('access_token')
+              st2, rb2 = req('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken'
+                             % urllib.parse.quote(SA, safe=''),
+                             data=json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
+                                              'lifetime': '3600s'}).encode(), token=fed)
+              out['gen'] = st2
+              A = jl(rb2).get('accessToken')
+              if st2 != 200 or not A:
+                  out['verdict'] = 'CHAIN_DEAD_GENERATE_TOKEN_FAIL'; out['gen_body'] = short(rb2, 400); emit(out); return
+              out['chain'] = 'CHAIN_ALIVE'
+
+              # 1) authoritative service state for GPU-capable APIs
+              svcs = {}
+              for s in ['compute.googleapis.com', 'aiplatform.googleapis.com', 'container.googleapis.com',
+                        'run.googleapis.com', 'storage.googleapis.com', 'notebooks.googleapis.com',
+                        'batch.googleapis.com', 'dataproc.googleapis.com', 'cloudbuild.googleapis.com']:
+                  st, rb = req('https://serviceusage.googleapis.com/v1/projects/%s/services/%s' % (PROJECT, s), token=A, tries=1)
+                  j = jl(rb)
+                  svcs[s] = {'http': st, 'state': j.get('state'), 'name': j.get('name'),
+                             'err': short(rb, 300) if st != 200 else ''}
+              out['service_state'] = svcs
+
+              # 2) corrected GKE clusters probes
+              gke = {}
+              for label, u in [
+                  ('v1_locations_all', 'https://container.googleapis.com/v1/projects/%s/locations/-/clusters' % PROJECT),
+                  ('v1_zones_all', 'https://container.googleapis.com/v1/projects/%s/zones/-/clusters' % PROJECT),
+                  ('v1beta1_locations_all', 'https://container.googleapis.com/v1beta1/projects/%s/locations/-/clusters' % PROJECT),
+                  ('v1_locations', 'https://container.googleapis.com/v1/projects/%s/locations' % PROJECT),
+              ]:
+                  st, rb = req(u, token=A, tries=1)
+                  j = jl(rb)
+                  cl = j.get('clusters') or []
+                  gke[label] = {'http': st, 'n_clusters': len(cl),
+                                'clusters': [{'name': c.get('name'), 'location': c.get('location'),
+                                              'status': c.get('status'),
+                                              'nodePools': [{'name': p.get('name'),
+                                                             'machineType': (p.get('config') or {}).get('machineType'),
+                                                             'accelerators': (p.get('config') or {}).get('accelerators'),
+                                                             'status': p.get('status')}
+                                                            for p in (c.get('nodePools') or [])]}
+                                             for c in cl],
+                                'err': short(rb, 400) if st != 200 else ''}
+              out['gke'] = gke
+
+              # 3) aiplatform resource-path probes (API is disabled; record the verbatim on the exact paths)
+              ai = {}
+              for kind in ('locations', 'endpoints', 'models', 'customJobs'):
+                  if kind == 'locations':
+                      u = 'https://aiplatform.googleapis.com/v1/projects/%s/locations' % PROJECT
+                  else:
+                      u = 'https://aiplatform.googleapis.com/v1/projects/%s/locations/us-central1/%s' % (PROJECT, kind)
+                  st, rb = req(u, token=A, tries=1)
+                  ai[kind] = {'http': st, 'err': short(rb, 400) if st != 200 else 'OK'}
+              out['aiplatform_paths'] = ai
+              out['t_end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              for sec in (A, tok):
+                  out = json.loads(json.dumps(out).replace(sec, 'REDACTED'))
+              out['verdict'] = 'CENSUS_FOLLOWUP_DONE'
+              emit(out)
+              print('DONE', flush=True)
+
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as ex:
+                  import traceback
+                  print('FATAL ' + repr(ex), flush=True)
+                  traceback.print_exc()
+                  try:
+                      emit({'fatal': repr(ex)[:400]})
+                  except Exception:
+                      pass
+          PYSCRIPT
